@@ -145,7 +145,7 @@ func TestTwoNodesMeetThroughTheCLI(t *testing.T) {
 	if !strings.Contains(miniOut, "100.64.0.1") {
 		t.Fatalf("join did not print the first overlay address:\n%s", miniOut)
 	}
-	if !strings.Contains(miniOut, "no peers yet") {
+	if !strings.Contains(miniOut, "no other Nodes yet") {
 		t.Fatalf("the first Node should have no peers yet:\n%s", miniOut)
 	}
 
@@ -161,7 +161,7 @@ func TestTwoNodesMeetThroughTheCLI(t *testing.T) {
 
 	// The first Node must see it without anyone asking again: the long poll
 	// wakes on the enrollment.
-	out := h.run(h.agentBin, "peers")
+	out := h.run(h.agentBin, "nodes")
 	if !strings.Contains(out, "macbook") {
 		t.Fatalf("mac-mini does not see macbook:\n%s", out)
 	}
@@ -174,7 +174,7 @@ func TestPeersWatchWakesUpWhenANodeJoins(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	watch := exec.CommandContext(ctx, h.agentBin, "peers", "--watch")
+	watch := exec.CommandContext(ctx, h.agentBin, "nodes", "--watch")
 	watch.Env = h.env
 	stdout, err := watch.StdoutPipe()
 	if err != nil {
@@ -182,7 +182,7 @@ func TestPeersWatchWakesUpWhenANodeJoins(t *testing.T) {
 	}
 	watch.Stderr = os.Stderr
 	if err := watch.Start(); err != nil {
-		t.Fatalf("start peers --watch: %v", err)
+		t.Fatalf("start nodes --watch: %v", err)
 	}
 	defer func() { watch.Process.Kill(); watch.Wait() }()
 
@@ -211,10 +211,10 @@ func TestPeersWatchWakesUpWhenANodeJoins(t *testing.T) {
 	select {
 	case line, ok := <-found:
 		if !ok {
-			t.Fatal("peers --watch exited before macbook appeared")
+			t.Fatal("nodes --watch exited before macbook appeared")
 		}
 		t.Logf("watch reported: %s", line)
 	case <-time.After(20 * time.Second):
-		t.Fatal("peers --watch never reported macbook")
+		t.Fatal("nodes --watch never reported macbook")
 	}
 }

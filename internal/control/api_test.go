@@ -445,3 +445,74 @@ func TestStateSurvivesRestart(t *testing.T) {
 		t.Errorf("next address after restart = %s, want 100.64.0.2", book.IPv4)
 	}
 }
+
+func TestAdminTokenIsGeneratedOnceAndKept(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dotlink.db")
+	cfg := Config{
+		DBPath: path, PublicURL: "https://203.0.113.7:8443",
+		NetworkName: "home", Domain: "dotlink",
+		LongPollTimeout: 50 * time.Millisecond, Now: time.Now,
+	}
+
+	first, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	if !first.GeneratedAdminToken {
+		t.Error("first start should report a generated admin token")
+	}
+	token := first.AdminToken
+	first.Close()
+
+	// A restart must reuse the stored token, or every restart locks the
+	// operator out of their own CLI.
+	second, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer second.Close()
+	if second.GeneratedAdminToken {
+		t.Error("second start must not mint a new admin token")
+	}
+	if second.AdminToken != token {
+		t.Errorf("admin token changed across restart")
+	}
+
+	// An explicitly configured token wins over the stored one.
+	cfg.AdminToken = "dlk_adm_configured"
+	third, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("third Open: %v", err)
+	}
+	defer third.Close()
+	if third.AdminToken != "dlk_adm_configured" {
+		t.Errorf("configured admin token ignored")
+	}
+}
+
+func TestOverlayAddrsWalkTheSlash10(t *testing.T) {
+	cases := []struct {
+		index  int
+		v4, v6 string
+	}{
+		{1, "100.64.0.1", "fd00::1"},
+		{254, "100.64.0.254", "fd00::fe"},
+		{255, "100.64.0.255", "fd00::ff"},
+		{256, "100.64.1.0", "fd00::100"},
+		{overlayV4Last, "100.127.255.254", "fd00::3ffffe"},
+	}
+	for _, c := range cases {
+		v4, v6, err := overlayAddrs(c.index)
+		if err != nil {
+			t.Fatalf("index %d: %v", c.index, err)
+		}
+		if v4 != c.v4 || v6 != c.v6 {
+			t.Errorf("index %d = %s / %s, want %s / %s", c.index, v4, v6, c.v4, c.v6)
+		}
+	}
+	for _, bad := range []int{0, -1, overlayV4Last + 1} {
+		if _, _, err := overlayAddrs(bad); err == nil {
+			t.Errorf("index %d should be rejected", bad)
+		}
+	}
+}

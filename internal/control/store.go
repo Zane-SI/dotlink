@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// schema keeps three tables: the two the API owns, plus meta for the few
+// scalars that must survive a restart (map version, address cursor, admin
+// token). docs/spec/v1.md §3.3 describes the same shape.
 const schema = `
 CREATE TABLE IF NOT EXISTS invites (
 	id         TEXT PRIMARY KEY,
@@ -34,7 +38,6 @@ CREATE TABLE IF NOT EXISTS nodes (
 	node_token TEXT NOT NULL UNIQUE,
 	created_at INTEGER NOT NULL,
 	last_seen  INTEGER,
-	path       TEXT NOT NULL DEFAULT 'unknown',
 	candidates TEXT NOT NULL DEFAULT '[]',
 	subnets    TEXT NOT NULL DEFAULT '[]',
 	revoked    INTEGER NOT NULL DEFAULT 0
@@ -79,6 +82,30 @@ func (s *Server) openDB(path string) error {
 		return fmt.Errorf("apply schema: %w", err)
 	}
 	s.db = db
+	return nil
+}
+
+// getMeta reads one meta scalar. A missing key returns the fallback.
+func (s *Server) getMeta(key, fallback string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return fallback, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read meta %s: %w", key, err)
+	}
+	return v, nil
+}
+
+// setMeta writes one meta scalar.
+func (s *Server) setMeta(key, value string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO meta (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	if err != nil {
+		return fmt.Errorf("write meta %s: %w", key, err)
+	}
 	return nil
 }
 
@@ -139,14 +166,7 @@ func (s *Server) deleteInvite(id string) error {
 	if err != nil {
 		return fmt.Errorf("delete invite: %w", err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("rows affected: %w", err)
-	}
-	if n == 0 {
-		return errNotFound
-	}
-	return nil
+	return mustAffectOne(res, errNotFound)
 }
 
 // nodeRow is the storage shape of a Node.
@@ -160,7 +180,6 @@ type nodeRow struct {
 	NodeToken  string
 	CreatedAt  time.Time
 	LastSeen   time.Time
-	Path       string
 	Candidates []proto.Candidate
 	Subnets    []string
 }
@@ -169,6 +188,11 @@ type nodeRow struct {
 // online. Heartbeats are a later ticket; for now, polling the map is the
 // liveness signal.
 const onlineWindow = 2 * time.Minute
+
+// isOnline is the one definition of "online" the API and the map share.
+func isOnline(now, lastSeen time.Time) bool {
+	return !lastSeen.IsZero() && now.Sub(lastSeen) < onlineWindow
+}
 
 // enroll redeems an Invite and creates the Node in one transaction, so a crash
 // can never leave an Invite spent without a Node behind it.
@@ -208,7 +232,11 @@ func (s *Server) enroll(req proto.EnrollRequest, now time.Time) (nodeRow, error)
 	if err != nil {
 		return nodeRow{}, err
 	}
-	n, err := allocAddr(tx)
+	index, err := nextAddrIndex(tx)
+	if err != nil {
+		return nodeRow{}, err
+	}
+	ipv4, ipv6, err := overlayAddrs(index)
 	if err != nil {
 		return nodeRow{}, err
 	}
@@ -218,25 +246,24 @@ func (s *Server) enroll(req proto.EnrollRequest, now time.Time) (nodeRow, error)
 		Hostname:   req.Hostname,
 		OS:         req.OS,
 		Pubkey:     req.Pubkey,
-		IPv4:       fmt.Sprintf("100.64.%d.%d", (n-1)/254, (n-1)%254+1),
-		IPv6:       fmt.Sprintf("fd00::%x", n),
+		IPv4:       ipv4,
+		IPv6:       ipv6,
 		NodeToken:  nodeToken,
 		CreatedAt:  now,
 		LastSeen:   now,
-		Path:       "unknown",
 		Candidates: req.Candidates,
 		Subnets:    []string{},
 	}
 
-	cand, err := json.Marshal(row.Candidates)
+	cand, err := json.Marshal(orEmpty(row.Candidates))
 	if err != nil {
 		return nodeRow{}, fmt.Errorf("marshal candidates: %w", err)
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO nodes (id, hostname, os, pubkey, ipv4, ipv6, node_token, created_at, last_seen, path, candidates, subnets)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]')`,
+		`INSERT INTO nodes (id, hostname, os, pubkey, ipv4, ipv6, node_token, created_at, last_seen, candidates)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		row.ID, row.Hostname, row.OS, row.Pubkey, row.IPv4, row.IPv6,
-		row.NodeToken, row.CreatedAt.Unix(), row.LastSeen.Unix(), row.Path, string(cand),
+		row.NodeToken, row.CreatedAt.Unix(), row.LastSeen.Unix(), string(cand),
 	); err != nil {
 		return nodeRow{}, fmt.Errorf("insert node: %w", err)
 	}
@@ -249,8 +276,15 @@ func (s *Server) enroll(req proto.EnrollRequest, now time.Time) (nodeRow, error)
 	return row, nil
 }
 
-// allocAddr hands out the next address index. 100.64.0.1 is index 1.
-func allocAddr(tx *sql.Tx) (int, error) {
+// The Overlay IPv4 pool is 100.64.0.0/10 (spec §5). Index 0 is the network
+// address, so addresses start at 100.64.0.1 and run up to the last host.
+const (
+	overlayV4Base = 0x64400000 // 100.64.0.0
+	overlayV4Last = 0x003FFFFE // 100.127.255.254, the /10's last host
+)
+
+// nextAddrIndex hands out the next address index. 1 is the first host.
+func nextAddrIndex(tx *sql.Tx) (int, error) {
 	var raw string
 	err := tx.QueryRow(`SELECT value FROM meta WHERE key = 'next_ip'`).Scan(&raw)
 	next := 1
@@ -272,7 +306,17 @@ func allocAddr(tx *sql.Tx) (int, error) {
 	return next, nil
 }
 
-const nodeColumns = `id, hostname, os, pubkey, ipv4, ipv6, node_token, created_at, coalesce(last_seen, 0), path, candidates, subnets`
+// overlayAddrs turns an index into the Node's two Overlay addresses.
+func overlayAddrs(index int) (ipv4, ipv6 string, err error) {
+	if index < 1 || index > overlayV4Last {
+		return "", "", fmt.Errorf("overlay address space exhausted at index %d", index)
+	}
+	a := uint32(overlayV4Base) + uint32(index)
+	return net.IPv4(byte(a>>24), byte(a>>16), byte(a>>8), byte(a)).String(),
+		fmt.Sprintf("fd00::%x", index), nil
+}
+
+const nodeColumns = `id, hostname, os, pubkey, ipv4, ipv6, node_token, created_at, coalesce(last_seen, 0), candidates, subnets`
 
 func scanNode(row interface{ Scan(...any) error }) (nodeRow, error) {
 	var (
@@ -283,7 +327,7 @@ func scanNode(row interface{ Scan(...any) error }) (nodeRow, error) {
 		subnets  string
 	)
 	if err := row.Scan(&n.ID, &n.Hostname, &n.OS, &n.Pubkey, &n.IPv4, &n.IPv6,
-		&n.NodeToken, &created, &lastSeen, &n.Path, &cand, &subnets); err != nil {
+		&n.NodeToken, &created, &lastSeen, &cand, &subnets); err != nil {
 		return nodeRow{}, err
 	}
 	n.CreatedAt = time.Unix(created, 0).UTC()
@@ -342,12 +386,25 @@ func (s *Server) revokeNode(id string) error {
 	if err != nil {
 		return fmt.Errorf("revoke node: %w", err)
 	}
+	return mustAffectOne(res, errNotFound)
+}
+
+// mustAffectOne turns "no row matched" into notFound.
+func mustAffectOne(res sql.Result, ifNone error) error {
 	n, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("rows affected: %w", err)
 	}
 	if n == 0 {
-		return errNotFound
+		return ifNone
 	}
 	return nil
+}
+
+// orEmpty turns a nil slice into an empty one so the JSON is [] not null.
+func orEmpty[T any](s []T) []T {
+	if s == nil {
+		return []T{}
+	}
+	return s
 }

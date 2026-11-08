@@ -3,7 +3,6 @@ package control
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -16,18 +15,18 @@ import (
 func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 	row, err := s.createInvite(s.now())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.fail(w, "create invite", err)
 		return
 	}
 	// An Invite is not part of the Peer Map, so it does not bump the version:
-	// waking every Agent for a credential that no Peer can see would be noise.
+	// waking every Agent for a credential that no Node can see would be noise.
 	writeJSON(w, http.StatusCreated, s.toProtoInvite(row))
 }
 
 func (s *Server) handleListInvites(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.listInvites()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.fail(w, "list invites", err)
 		return
 	}
 	out := make([]proto.Invite, 0, len(rows))
@@ -39,17 +38,14 @@ func (s *Server) handleListInvites(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteInvite(w http.ResponseWriter, r *http.Request, id string) {
 	if id == "" {
-		http.NotFound(w, r)
+		writeError(w, http.StatusNotFound, "invite not found")
 		return
 	}
-	switch err := s.deleteInvite(id); err {
-	case nil:
-		w.WriteHeader(http.StatusNoContent)
-	case errNotFound:
-		writeError(w, http.StatusNotFound, "invite not found or already used")
-	default:
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err := s.deleteInvite(id); err != nil {
+		s.storeError(w, err, "invite not found or already used")
+		return
 	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // enrollURL renders the dotlink:// URL for the QR code. It carries the Control
@@ -75,9 +71,8 @@ func (s *Server) toProtoInvite(row inviteRow) proto.Invite {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("encode response: %v", err)
-	}
+	// A write failure here means the client hung up; there is nobody to tell.
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
@@ -87,6 +82,27 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 func methodNotAllowed(w http.ResponseWriter, allowed ...string) {
 	w.Header().Set("Allow", strings.Join(allowed, ", "))
 	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+// fail logs the cause and answers 500 without leaking internals to the caller.
+func (s *Server) fail(w http.ResponseWriter, op string, err error) {
+	s.log.Error(op, "err", err)
+	writeError(w, http.StatusInternalServerError, "internal error")
+}
+
+// storeError maps the three storage outcomes every handler shares.
+func (s *Server) storeError(w http.ResponseWriter, err error, notFoundMsg string) {
+	switch err {
+	case nil:
+	case errNotFound:
+		writeError(w, http.StatusNotFound, notFoundMsg)
+	case errInviteUsed:
+		writeError(w, http.StatusConflict, "invite already used")
+	case errInviteExpired:
+		writeError(w, http.StatusGone, "invite expired")
+	default:
+		s.fail(w, "storage", err)
+	}
 }
 
 func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
@@ -101,33 +117,22 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	row, err := s.enroll(req, s.now())
-	switch err {
-	case nil:
-	case errNotFound:
-		writeError(w, http.StatusNotFound, "invite not found")
-		return
-	case errInviteUsed:
-		writeError(w, http.StatusConflict, "invite already used")
-		return
-	case errInviteExpired:
-		writeError(w, http.StatusGone, "invite expired")
-		return
-	default:
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err != nil {
+		s.storeError(w, err, "invite not found")
 		return
 	}
-
 	if err := s.bumpVersion(); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.fail(w, "bump version", err)
 		return
 	}
 
+	s.log.Info("node enrolled", "node", row.ID, "hostname", row.Hostname, "ipv4", row.IPv4)
 	writeJSON(w, http.StatusOK, proto.EnrollResponse{
 		NodeID:     row.ID,
 		NodeToken:  row.NodeToken,
 		IPv4:       row.IPv4,
 		IPv6:       row.IPv6,
-		Network:    proto.Network{Name: s.cfg.NetworkName, Domain: s.cfg.Domain},
+		Network:    s.network(),
 		Relays:     s.relays(),
 		MapVersion: s.currentVersion(),
 	})
@@ -151,7 +156,7 @@ func (s *Server) handleMap(w http.ResponseWriter, r *http.Request) {
 
 	// Polling is the liveness signal until heartbeats land in a later ticket.
 	if err := s.touchNode(node.ID, s.now()); err != nil {
-		log.Printf("touch node %s: %v", node.ID, err)
+		s.log.Warn("touch node", "node", node.ID, "err", err)
 	}
 
 	if since == s.currentVersion() {
@@ -163,7 +168,7 @@ func (s *Server) handleMap(w http.ResponseWriter, r *http.Request) {
 
 	pm, err := s.buildMap(node)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.fail(w, "build map", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, pm)
@@ -177,28 +182,20 @@ func (s *Server) buildMap(self nodeRow) (proto.PeerMap, error) {
 	}
 	now := s.now()
 
-	peers := make([]proto.Peer, 0, len(nodes))
+	peers := make([]proto.Node, 0, len(nodes))
 	for _, n := range nodes {
 		if n.ID == self.ID {
 			continue
 		}
-		cands := n.Candidates
-		if cands == nil {
-			cands = []proto.Candidate{}
-		}
-		subnets := n.Subnets
-		if subnets == nil {
-			subnets = []string{}
-		}
-		peers = append(peers, proto.Peer{
+		peers = append(peers, proto.Node{
 			NodeID:       n.ID,
 			Hostname:     n.Hostname,
 			Pubkey:       n.Pubkey,
 			IPv4:         n.IPv4,
 			IPv6:         n.IPv6,
-			Candidates:   cands,
-			SubnetRoutes: subnets,
-			Online:       now.Sub(n.LastSeen) < onlineWindow,
+			Candidates:   orEmpty(n.Candidates),
+			SubnetRoutes: orEmpty(n.Subnets),
+			Online:       isOnline(now, n.LastSeen),
 			LastSeen:     n.LastSeen,
 		})
 	}
@@ -211,24 +208,23 @@ func (s *Server) buildMap(self nodeRow) (proto.PeerMap, error) {
 			IPv6:     self.IPv6,
 			Hostname: self.Hostname,
 		},
-		Network: proto.Network{Name: s.cfg.NetworkName, Domain: s.cfg.Domain},
+		Network: s.network(),
 		Peers:   peers,
 		Relays:  s.relays(),
 	}, nil
 }
 
-// relays never returns nil, so the JSON is [] rather than null.
-func (s *Server) relays() []proto.Relay {
-	if len(s.cfg.Relays) == 0 {
-		return []proto.Relay{}
-	}
-	return s.cfg.Relays
+func (s *Server) network() proto.Network {
+	return proto.Network{Name: s.cfg.NetworkName, Domain: s.cfg.Domain}
 }
+
+// relays never returns nil, so the JSON is [] rather than null.
+func (s *Server) relays() []proto.Relay { return orEmpty(s.cfg.Relays) }
 
 func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 	nodes, err := s.listNodes()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		s.fail(w, "list nodes", err)
 		return
 	}
 	now := s.now()
@@ -241,13 +237,14 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 			IPv4:     n.IPv4,
 			IPv6:     n.IPv6,
 			Pubkey:   n.Pubkey,
-			Online:   now.Sub(n.LastSeen) < onlineWindow,
+			Online:   isOnline(now, n.LastSeen),
 			LastSeen: n.LastSeen,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": out})
 }
 
+// adminNode is the operator's view: a Node plus the fields the Peer Map hides.
 type adminNode struct {
 	NodeID   string    `json:"node_id"`
 	Hostname string    `json:"hostname"`
@@ -261,18 +258,15 @@ type adminNode struct {
 
 func (s *Server) handleRevokeNode(w http.ResponseWriter, r *http.Request, id string) {
 	if id == "" {
-		http.NotFound(w, r)
+		writeError(w, http.StatusNotFound, "node not found")
 		return
 	}
-	switch err := s.revokeNode(id); err {
-	case nil:
-		if err := s.bumpVersion(); err != nil {
-			log.Printf("bump version: %v", err)
-		}
-		w.WriteHeader(http.StatusNoContent)
-	case errNotFound:
-		writeError(w, http.StatusNotFound, "node not found")
-	default:
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err := s.revokeNode(id); err != nil {
+		s.storeError(w, err, "node not found")
+		return
 	}
+	if err := s.bumpVersion(); err != nil {
+		s.log.Error("bump version after revoke", "node", id, "err", err)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

@@ -8,7 +8,8 @@ type Network struct {
 	Domain string `json:"domain"`
 }
 
-// Relay is a node the Agent can fall back to when hole punching fails.
+// Relay is the server an Agent falls back to when hole punching fails.
+// It is infrastructure, not a Node: it forwards sealed packets and can read none.
 type Relay struct {
 	ID   string `json:"id"`
 	UDP  string `json:"udp"`
@@ -30,8 +31,9 @@ type Self struct {
 	Hostname string `json:"hostname"`
 }
 
-// Peer is another Node in the same Network.
-type Peer struct {
+// Node is another Node in the same Network. The map's JSON key for these
+// is "peers" (docs/spec/v1.md §3.2); everywhere else the term is Node.
+type Node struct {
 	NodeID       string      `json:"node_id"`
 	Hostname     string      `json:"hostname"`
 	Pubkey       string      `json:"pubkey"`
@@ -49,6 +51,6 @@ type PeerMap struct {
 	Version int64   `json:"version"`
 	Self    Self    `json:"self"`
 	Network Network `json:"network"`
-	Peers   []Peer  `json:"peers"`
+	Peers   []Node  `json:"peers"`
 	Relays  []Relay `json:"relays"`
 }

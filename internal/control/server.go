@@ -5,7 +5,9 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,8 +23,10 @@ type Config struct {
 	// because "data survives a restart" is behavior worth testing.
 	DBPath string
 
-	// AdminToken authorizes /v1/admin/*. When empty, Open generates one and
-	// exposes it as Server.AdminToken for the caller to print.
+	// AdminToken authorizes /v1/admin/*. When empty, Open reuses the token in
+	// the database, generating one only on first start. Spec §3.1: it is
+	// generated once and kept, otherwise every restart would lock the operator
+	// out of their own CLI.
 	AdminToken string
 
 	// PublicURL is what goes into the QR code, e.g. https://203.0.113.7:8443.
@@ -44,6 +48,9 @@ type Config struct {
 	// Now is the clock. Tests substitute a fake one to walk past Invite
 	// expiry without sleeping 24 hours.
 	Now func() time.Time
+
+	// Logger receives structured JSON logs (spec §9). Nil means JSON on stderr.
+	Logger *slog.Logger
 }
 
 // Server is the Control Plane. It is an http.Handler, so tests drive it
@@ -51,9 +58,15 @@ type Config struct {
 type Server struct {
 	cfg Config
 	db  *sql.DB
+	log *slog.Logger
 
-	// AdminToken is the effective token, generated when Config had none.
+	// AdminToken is the effective token: the configured one, the stored one,
+	// or a freshly generated one.
 	AdminToken string
+
+	// GeneratedAdminToken reports that this start minted the token, so the CLI
+	// knows to print it exactly once instead of on every restart.
+	GeneratedAdminToken bool
 
 	mu      sync.Mutex
 	version int64
@@ -77,17 +90,11 @@ func Open(cfg Config) (*Server, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-
-	s := &Server{cfg: cfg, changes: make(chan struct{})}
-
-	token := cfg.AdminToken
-	if token == "" {
-		var err error
-		if token, err = newToken("dlk_adm_", 15); err != nil {
-			return nil, err
-		}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	}
-	s.AdminToken = token
+
+	s := &Server{cfg: cfg, log: cfg.Logger, changes: make(chan struct{})}
 
 	if err := s.openDB(cfg.DBPath); err != nil {
 		return nil, err
@@ -96,7 +103,38 @@ func Open(cfg Config) (*Server, error) {
 		s.db.Close()
 		return nil, err
 	}
+	if err := s.resolveAdminToken(cfg.AdminToken); err != nil {
+		s.db.Close()
+		return nil, err
+	}
 	return s, nil
+}
+
+// resolveAdminToken picks the admin token: configured, else stored, else new.
+// Only a new token is reported as generated, so the CLI prints it once.
+func (s *Server) resolveAdminToken(configured string) error {
+	if configured != "" {
+		s.AdminToken = configured
+		return nil
+	}
+	stored, err := s.getMeta("admin_token", "")
+	if err != nil {
+		return err
+	}
+	if stored != "" {
+		s.AdminToken = stored
+		return nil
+	}
+	token, err := newToken("dlk_adm_", 15)
+	if err != nil {
+		return err
+	}
+	if err := s.setMeta("admin_token", token); err != nil {
+		return err
+	}
+	s.AdminToken = token
+	s.GeneratedAdminToken = true
+	return nil
 }
 
 // Close releases the SQLite handle.
@@ -221,25 +259,17 @@ func (s *Server) bumpVersion() error {
 	s.changes = make(chan struct{})
 	s.mu.Unlock()
 
-	_, err := s.db.Exec(
-		`INSERT INTO meta (key, value) VALUES ('map_version', ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-		strconv.FormatInt(v, 10))
-	return err
+	return s.setMeta("map_version", strconv.FormatInt(v, 10))
 }
 
 func (s *Server) loadVersion() error {
-	var raw string
-	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'map_version'`).Scan(&raw)
-	if err == sql.ErrNoRows {
-		return nil
-	}
+	raw, err := s.getMeta("map_version", "0")
 	if err != nil {
 		return err
 	}
 	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
-		return err
+		return fmt.Errorf("parse map_version %q: %w", raw, err)
 	}
 	s.version = v
 	return nil

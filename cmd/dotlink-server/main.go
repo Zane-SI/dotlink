@@ -3,15 +3,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/Zane-SI/dotlink/internal/agent"
 	"github.com/Zane-SI/dotlink/internal/control"
 	"github.com/Zane-SI/dotlink/internal/proto"
 )
@@ -58,7 +59,9 @@ func runControl(args []string) error {
 	publicURL := fs.String("public-url", "", "address Agents reach, e.g. https://203.0.113.7:8443 (defaults to http://<addr>)")
 	network := fs.String("network", "home", "Network name")
 	domain := fs.String("domain", "dotlink", "MagicDNS pseudo-TLD")
-	adminToken := fs.String("admin-token", "", "admin token (generated and printed when empty)")
+	adminToken := fs.String("admin-token", "", "admin token (generated once and printed on first start when empty)")
+	tlsCert := fs.String("tls-cert", "", "PEM certificate; with -tls-key, serve HTTPS (spec §8)")
+	tlsKey := fs.String("tls-key", "", "PEM private key")
 	relayUDP := fs.String("relay-udp", "", "Relay UDP address handed to Agents")
 	relayDERP := fs.String("relay-derp", "", "Relay DERP URL handed to Agents")
 	if err := fs.Parse(args); err != nil {
@@ -74,7 +77,14 @@ func runControl(args []string) error {
 		if host == "" || host == "0.0.0.0" || host == "::" {
 			host = "127.0.0.1"
 		}
-		url = "http://" + net.JoinHostPort(host, port)
+		scheme := "http"
+		if *tlsCert != "" {
+			scheme = "https"
+		}
+		url = scheme + "://" + net.JoinHostPort(host, port)
+	}
+	if (*tlsCert == "") != (*tlsKey == "") {
+		return fmt.Errorf("-tls-cert and -tls-key must be given together")
 	}
 
 	cfg := control.Config{
@@ -94,18 +104,20 @@ func runControl(args []string) error {
 	}
 	defer srv.Close()
 
-	if *adminToken == "" {
+	if srv.GeneratedAdminToken {
 		fmt.Printf("admin token: %s\n", srv.AdminToken)
-		fmt.Println("             this is the only time it is printed; save it now")
+		fmt.Println("             generated once and stored in the database; save it now")
 	}
-	fmt.Printf("listening on %s (public URL %s)\n", *addr, url)
-	fmt.Printf("network %q, MagicDNS domain .%s\n", *network, *domain)
-
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", *addr, err)
 	}
+	fmt.Printf("listening on %s (public URL %s)\n", *addr, url)
+	fmt.Printf("network %q, MagicDNS domain .%s\n", *network, *domain)
 	httpSrv := &http.Server{Handler: srv, ReadHeaderTimeout: 10 * time.Second}
+	if *tlsCert != "" {
+		return httpSrv.ServeTLS(ln, *tlsCert, *tlsKey)
+	}
 	return httpSrv.Serve(ln)
 }
 
@@ -126,12 +138,11 @@ func runInvite(args []string) error {
 		return fmt.Errorf("admin token required: pass -admin-token or set DOTLINK_ADMIN_TOKEN")
 	}
 
-	url, err := agent.NormalizeServer(*server)
-	if err != nil {
-		return err
+	url := strings.TrimRight(*server, "/")
+	if !strings.Contains(url, "://") {
+		url = "https://" + url
 	}
-	c := &agent.Client{Server: url, Token: token, HTTP: agent.DefaultHTTPClient()}
-	inv, err := c.CreateInvite()
+	inv, err := control.NewAdmin(url, token).CreateInvite(context.Background())
 	if err != nil {
 		return err
 	}

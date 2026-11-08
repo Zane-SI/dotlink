@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -24,8 +25,8 @@ func main() {
 	switch os.Args[1] {
 	case "join":
 		err = runJoin(os.Args[2:])
-	case "peers":
-		err = runPeers(os.Args[2:])
+	case "nodes":
+		err = runNodes(os.Args[2:])
 	case "status":
 		err = runStatus(os.Args[2:])
 	case "-h", "--help", "help":
@@ -46,7 +47,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `dotlink-agent — join a Dotlink Network
 
   dotlink-agent join <dotlink://enroll?...>   redeem an invite
-  dotlink-agent peers [flags]                 list the Nodes you can reach
+  dotlink-agent nodes [flags]                 list the Nodes you can reach
   dotlink-agent status                        show this Node's identity
 
 Run "dotlink-agent <command> -h" for flags.
@@ -78,7 +79,7 @@ func runJoin(args []string) error {
 		name = defaultHostname()
 	}
 
-	st, err := agent.Enroll(link, name, runtime.GOOS)
+	st, err := agent.Enroll(context.Background(), link, name, runtime.GOOS)
 	if err != nil {
 		return err
 	}
@@ -91,17 +92,17 @@ func runJoin(args []string) error {
 	fmt.Printf("overlay: %s / %s\n", st.IPv4, st.IPv6)
 	fmt.Printf("state:   %s\n", path)
 
-	pm, err := st.Client().Map(0)
+	pm, err := st.Control().Map(context.Background(), 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not read the Peer Map yet: %v\n", err)
 		return nil
 	}
-	printPeers(pm)
+	printNodes(pm)
 	return nil
 }
 
-func runPeers(args []string) error {
-	fs := flag.NewFlagSet("peers", flag.ExitOnError)
+func runNodes(args []string) error {
+	fs := flag.NewFlagSet("nodes", flag.ExitOnError)
 	watch := fs.Bool("watch", false, "keep long-polling and print the map whenever it changes")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -111,20 +112,20 @@ func runPeers(args []string) error {
 	if err != nil {
 		return err
 	}
-	client := st.Client()
+	ctl := st.Control()
 
 	if !*watch {
-		pm, err := client.Map(0)
+		pm, err := ctl.Map(context.Background(), 0)
 		if err != nil {
 			return err
 		}
-		printPeers(pm)
+		printNodes(pm)
 		return nil
 	}
 
 	since := st.Version
 	for {
-		pm, err := client.Map(since)
+		pm, err := ctl.Map(context.Background(), since)
 		if err != nil {
 			return err
 		}
@@ -132,7 +133,7 @@ func runPeers(args []string) error {
 			continue // long poll timed out with nothing new
 		}
 		since = pm.Version
-		printPeers(pm)
+		printNodes(pm)
 		fmt.Println()
 	}
 }
@@ -155,14 +156,14 @@ func runStatus(args []string) error {
 	return nil
 }
 
-func printPeers(pm *proto.PeerMap) {
+func printNodes(pm *proto.PeerMap) {
 	if pm == nil {
 		fmt.Println("no map yet")
 		return
 	}
 	fmt.Printf("version %d — self %s (%s)\n", pm.Version, pm.Self.Hostname, pm.Self.IPv4)
 	if len(pm.Peers) == 0 {
-		fmt.Println("no peers yet: invite another device")
+		fmt.Println("no other Nodes yet: invite someone with `dotlink-server invite`")
 		return
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
