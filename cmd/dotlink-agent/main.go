@@ -1,5 +1,5 @@
-// Command dotlink-agent is the per-Node side. Today it enrolls and reads the
-// Peer Map; the tunnel arrives in the next ticket.
+// Command dotlink-agent is the per-Node side: it enrolls, brings the tunnel
+// up, and answers questions about what it can reach.
 package main
 
 import (
@@ -7,8 +7,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"os/user"
 	"runtime"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -27,6 +29,8 @@ func main() {
 		err = runJoin(os.Args[2:])
 	case "nodes":
 		err = runNodes(os.Args[2:])
+	case "up":
+		err = runUp(os.Args[2:])
 	case "status":
 		err = runStatus(os.Args[2:])
 	case "-h", "--help", "help":
@@ -47,8 +51,9 @@ func usage() {
 	fmt.Fprint(os.Stderr, `dotlink-agent — join a Dotlink Network
 
   dotlink-agent join <dotlink://enroll?...>   redeem an invite
+  dotlink-agent up   [flags]                  bring the tunnel up (needs root)
   dotlink-agent nodes [flags]                 list the Nodes you can reach
-  dotlink-agent status                        show this Node's identity
+  dotlink-agent status                        show this Node's identity and tunnel
 
 Run "dotlink-agent <command> -h" for flags.
 `)
@@ -138,6 +143,27 @@ func runNodes(args []string) error {
 	}
 }
 
+func runUp(args []string) error {
+	fs := flag.NewFlagSet("up", flag.ExitOnError)
+	listen := fs.String("listen", agent.DefaultUDPListen, "UDP listen address; the same socket carries Relay traffic and hole punching")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	st, err := agent.LoadState()
+	if err != nil {
+		return err
+	}
+
+	// A Ctrl-C must take the TUN and its routes down with it; the daemon
+	// cleans up on context cancellation.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	d := &agent.Daemon{State: st, UDPListen: *listen}
+	return d.Run(ctx)
+}
+
 func runStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	if err := fs.Parse(args); err != nil {
@@ -153,6 +179,30 @@ func runStatus(args []string) error {
 	fmt.Printf("overlay: %s / %s\n", st.IPv4, st.IPv6)
 	fmt.Printf("network: %s (MagicDNS .%s)\n", st.Network.Name, st.Network.Domain)
 	fmt.Printf("state:   %s\n", path)
+
+	rt, err := agent.LoadRuntime()
+	switch {
+	case err != nil:
+		fmt.Println("agent:   not running (start it with `sudo dotlink-agent up`)")
+		return nil
+	default:
+		registered := "not registered"
+		if rt.Registered {
+			registered = "registered"
+		}
+		fmt.Printf("agent:   running (pid %d, up %s, relay %s, %s)\n",
+			rt.PID, time.Since(rt.StartedAt).Round(time.Second), rt.RelayUDP, registered)
+	}
+	if len(rt.Peers) == 0 {
+		fmt.Println("peers:   none yet")
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "HOSTNAME\tIPV4\tPATH")
+	for _, p := range rt.Peers {
+		fmt.Fprintf(w, "%s\t%s\t%s\n", p.Hostname, p.IPv4, p.Path)
+	}
+	w.Flush()
 	return nil
 }
 

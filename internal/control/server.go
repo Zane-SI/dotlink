@@ -42,6 +42,11 @@ type Config struct {
 	// tests shrink it so the 204 path does not cost a minute.
 	LongPollTimeout time.Duration
 
+	// RelaySecret is the shared secret the Relay checks Agent HELLOs against.
+	// When empty, Open reuses the stored one or mints a new one, so a
+	// self-hoster never has to invent a second credential.
+	RelaySecret string
+
 	// Relays is what the Agent may fall back to. v1 has exactly one.
 	Relays []proto.Relay
 
@@ -67,6 +72,13 @@ type Server struct {
 	// GeneratedAdminToken reports that this start minted the token, so the CLI
 	// knows to print it exactly once instead of on every restart.
 	GeneratedAdminToken bool
+
+	// RelaySecret is the effective Relay secret. Every Relay entry in the map
+	// carries it, which is how an Agent that only scanned a QR code learns it.
+	RelaySecret string
+
+	// GeneratedRelaySecret reports that this start minted the secret.
+	GeneratedRelaySecret bool
 
 	mu      sync.Mutex
 	version int64
@@ -107,6 +119,10 @@ func Open(cfg Config) (*Server, error) {
 		s.db.Close()
 		return nil, err
 	}
+	if err := s.resolveRelaySecret(cfg.RelaySecret); err != nil {
+		s.db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -135,6 +151,48 @@ func (s *Server) resolveAdminToken(configured string) error {
 	s.AdminToken = token
 	s.GeneratedAdminToken = true
 	return nil
+}
+
+// resolveRelaySecret picks the Relay secret: configured, else stored, else new.
+func (s *Server) resolveRelaySecret(configured string) error {
+	if configured != "" {
+		s.RelaySecret = configured
+		return nil
+	}
+	stored, err := s.getMeta("relay_secret", "")
+	if err != nil {
+		return err
+	}
+	if stored != "" {
+		s.RelaySecret = stored
+		return nil
+	}
+	secret, err := newToken("dlk_rly_", 24)
+	if err != nil {
+		return err
+	}
+	if err := s.setMeta("relay_secret", secret); err != nil {
+		return err
+	}
+	s.RelaySecret = secret
+	s.GeneratedRelaySecret = true
+	return nil
+}
+
+// RelaySecretFromDB reads the Relay secret straight out of a Control Plane
+// database. A Relay running on the same host should not need a second copy of
+// a credential that is already on disk next to it.
+func RelaySecretFromDB(dbPath string) (string, error) {
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		return "", fmt.Errorf("open %s: %w", dbPath, err)
+	}
+	defer db.Close()
+	var secret string
+	if err := db.QueryRow(`SELECT value FROM meta WHERE key = 'relay_secret'`).Scan(&secret); err != nil {
+		return "", fmt.Errorf("read relay secret from %s: %w", dbPath, err)
+	}
+	return secret, nil
 }
 
 // Close releases the SQLite handle.
@@ -189,6 +247,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleMap(w, r)
+
+	case path == "/v1/candidates":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		s.handlePostCandidates(w, r)
+
+	case path == "/v1/heartbeat":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		s.handleHeartbeat(w, r)
 
 	case path == "/v1/admin/nodes":
 		if !s.requireAdmin(w, r) {

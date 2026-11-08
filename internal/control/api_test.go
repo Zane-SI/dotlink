@@ -516,3 +516,135 @@ func TestOverlayAddrsWalkTheSlash10(t *testing.T) {
 		}
 	}
 }
+
+func TestCandidatesReachPeersAndBumpTheVersion(t *testing.T) {
+	e := newTestEnv(t)
+	mini := e.joinNode(t, "mac-mini")
+	book := e.joinNode(t, "macbook")
+
+	var before proto.PeerMap
+	e.call(t, http.MethodGet, "/v1/map?since=-1", book.NodeToken, nil, &before)
+
+	post := struct {
+		Candidates []proto.Candidate `json:"candidates"`
+	}{[]proto.Candidate{
+		{Addr: "192.168.1.5:41641", Kind: "lan"},
+		{Addr: "203.0.113.7:41641", Kind: "stun"},
+	}}
+	resp := e.call(t, http.MethodPost, "/v1/candidates", mini.NodeToken, post, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("post candidates: status = %d, want 204", resp.StatusCode)
+	}
+
+	var after proto.PeerMap
+	e.call(t, http.MethodGet, "/v1/map?since=-1", book.NodeToken, nil, &after)
+	if len(after.Peers) != 1 {
+		t.Fatalf("peers = %d, want 1", len(after.Peers))
+	}
+	got := after.Peers[0].Candidates
+	if len(got) != 2 || got[0].Addr != "192.168.1.5:41641" || got[1].Kind != "stun" {
+		t.Fatalf("peer candidates = %+v, want the two just posted", got)
+	}
+	if after.Version <= before.Version {
+		t.Errorf("version = %d, want more than %d: peers never retry without a bump", after.Version, before.Version)
+	}
+}
+
+func TestRepostingTheSameCandidatesDoesNotBumpTheVersion(t *testing.T) {
+	e := newTestEnv(t)
+	mini := e.joinNode(t, "mac-mini")
+	book := e.joinNode(t, "macbook")
+	post := struct {
+		Candidates []proto.Candidate `json:"candidates"`
+	}{[]proto.Candidate{{Addr: "192.168.1.5:41641", Kind: "lan"}}}
+
+	e.call(t, http.MethodPost, "/v1/candidates", mini.NodeToken, post, nil)
+	var first proto.PeerMap
+	e.call(t, http.MethodGet, "/v1/map?since=-1", book.NodeToken, nil, &first)
+
+	e.call(t, http.MethodPost, "/v1/candidates", mini.NodeToken, post, nil)
+	var second proto.PeerMap
+	e.call(t, http.MethodGet, "/v1/map?since=-1", book.NodeToken, nil, &second)
+
+	if second.Version != first.Version {
+		t.Errorf("version moved from %d to %d for an unchanged list", first.Version, second.Version)
+	}
+}
+
+func TestCandidatesAreValidated(t *testing.T) {
+	e := newTestEnv(t)
+	mini := e.joinNode(t, "mac-mini")
+	tooMany := make([]proto.Candidate, maxCandidates+1)
+	for i := range tooMany {
+		tooMany[i] = proto.Candidate{Addr: "192.168.1.5:41641", Kind: "lan"}
+	}
+
+	cases := map[string]struct {
+		token string
+		body  any
+		want  int
+	}{
+		"no token":     {"", struct{}{}, http.StatusUnauthorized},
+		"bad token":    {"dlk_node_nope", struct{}{}, http.StatusUnauthorized},
+		"not ip:port":  {mini.NodeToken, cands(proto.Candidate{Addr: "192.168.1.5", Kind: "lan"}), http.StatusBadRequest},
+		"unknown kind": {mini.NodeToken, cands(proto.Candidate{Addr: "192.168.1.5:41641", Kind: "carrier-pigeon"}), http.StatusBadRequest},
+		"too many":     {mini.NodeToken, cands(tooMany...), http.StatusBadRequest},
+		"port zero":    {mini.NodeToken, cands(proto.Candidate{Addr: "192.168.1.5:0", Kind: "lan"}), http.StatusBadRequest},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			resp := e.call(t, http.MethodPost, "/v1/candidates", c.token, c.body, nil)
+			if resp.StatusCode != c.want {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, c.want)
+			}
+		})
+	}
+}
+
+func cands(c ...proto.Candidate) any {
+	return struct {
+		Candidates []proto.Candidate `json:"candidates"`
+	}{c}
+}
+
+func TestHeartbeatKeepsANodeOnline(t *testing.T) {
+	e := newTestEnv(t)
+	mini := e.joinNode(t, "mac-mini")
+	book := e.joinNode(t, "macbook")
+
+	e.clock.Advance(3 * time.Minute)
+
+	var gone proto.PeerMap
+	e.call(t, http.MethodGet, "/v1/map?since=-1", book.NodeToken, nil, &gone)
+	if peerByID(gone, mini.NodeID).Online {
+		t.Fatalf("mac-mini is still online after 3 minutes of silence")
+	}
+
+	resp := e.call(t, http.MethodPost, "/v1/heartbeat", mini.NodeToken, nil, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("heartbeat: status = %d, want 204", resp.StatusCode)
+	}
+
+	var back proto.PeerMap
+	e.call(t, http.MethodGet, "/v1/map?since=-1", book.NodeToken, nil, &back)
+	if !peerByID(back, mini.NodeID).Online {
+		t.Fatalf("mac-mini is still offline after a heartbeat")
+	}
+}
+
+func TestHeartbeatRequiresANodeToken(t *testing.T) {
+	e := newTestEnv(t)
+	resp := e.call(t, http.MethodPost, "/v1/heartbeat", "dlk_node_nope", nil, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func peerByID(pm proto.PeerMap, id string) proto.Node {
+	for _, p := range pm.Peers {
+		if p.NodeID == id {
+			return p
+		}
+	}
+	return proto.Node{}
+}

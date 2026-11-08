@@ -354,6 +354,26 @@ func (s *Server) nodeByToken(token string) (nodeRow, error) {
 	return n, err
 }
 
+// setCandidates replaces a Node's candidate list, reporting whether it
+// changed: the caller decides whether that is worth waking long polls over.
+func (s *Server) setCandidates(id string, cands []proto.Candidate) (bool, error) {
+	raw, err := json.Marshal(cands)
+	if err != nil {
+		return false, fmt.Errorf("marshal candidates: %w", err)
+	}
+	res, err := s.db.Exec(
+		`UPDATE nodes SET candidates = ? WHERE id = ? AND candidates <> ?`,
+		string(raw), id, string(raw))
+	if err != nil {
+		return false, fmt.Errorf("set candidates: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("set candidates: %w", err)
+	}
+	return n > 0, nil
+}
+
 // touchNode records liveness without bumping the map version: polling is not
 // a change other Nodes need to hear about.
 func (s *Server) touchNode(id string, now time.Time) error {

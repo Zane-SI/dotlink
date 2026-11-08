@@ -14,6 +14,11 @@ type Relay struct {
 	ID   string `json:"id"`
 	UDP  string `json:"udp"`
 	DERP string `json:"derp"`
+	// Secret is the network-wide shared secret the Relay checks the HELLO
+	// HMAC against. It rides in the map because every enrolled Node already
+	// trusts the Control Plane, and making users paste a second credential
+	// after scanning a QR code would be absurd.
+	Secret string `json:"secret,omitempty"`
 }
 
 // Candidate is one address where a Node might be reachable.

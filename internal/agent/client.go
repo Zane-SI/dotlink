@@ -67,6 +67,25 @@ func Enroll(ctx context.Context, link EnrollLink, hostname, osName string) (Stat
 	}, nil
 }
 
+// SetCandidates publishes the addresses peers can try to reach this Node at.
+func (c *Control) SetCandidates(ctx context.Context, cands []proto.Candidate) error {
+	return c.Do(ctx, http.MethodPost, "/v1/candidates", struct {
+		Candidates []proto.Candidate `json:"candidates"`
+	}{cands}, nil)
+}
+
+// Heartbeat refreshes this Node's last_seen without asking for the map.
+func (c *Control) Heartbeat(ctx context.Context) error {
+	status, err := c.DoStatus(ctx, http.MethodPost, "/v1/heartbeat", nil, nil)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusNoContent {
+		return fmt.Errorf("heartbeat: unexpected status %d", status)
+	}
+	return nil
+}
+
 // Map long-polls the Peer Map. It returns nil when the Control Plane had
 // nothing new within its long-poll window (HTTP 204).
 func (c *Control) Map(ctx context.Context, since int64) (*proto.PeerMap, error) {

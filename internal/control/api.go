@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -174,6 +175,81 @@ func (s *Server) handleMap(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, pm)
 }
 
+// maxCandidates bounds what one Node can make every other Node try. A Node
+// with a dozen addresses is either broken or fishing for a way in.
+const maxCandidates = 8
+
+// handlePostCandidates records where a Node says it can be reached. Nothing is
+// probed here: the addresses go straight into every other Node's map, which is
+// exactly why they are validated before they are stored.
+func (s *Server) handlePostCandidates(w http.ResponseWriter, r *http.Request) {
+	node, ok := s.requireNode(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Candidates []proto.Candidate `json:"candidates"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "body must be JSON with a candidates array")
+		return
+	}
+	cands, err := cleanCandidates(req.Candidates)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	changed, err := s.setCandidates(node.ID, cands)
+	if err != nil {
+		s.fail(w, "set candidates", err)
+		return
+	}
+	// Peers only act on candidates when the map changes, so a Node that moves
+	// to a new address has to bump the version or nobody would retry it.
+	if changed {
+		if err := s.bumpVersion(); err != nil {
+			s.fail(w, "bump version", err)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func cleanCandidates(in []proto.Candidate) ([]proto.Candidate, error) {
+	if len(in) > maxCandidates {
+		return nil, fmt.Errorf("at most %d candidates", maxCandidates)
+	}
+	out := make([]proto.Candidate, 0, len(in))
+	for _, c := range in {
+		ap, err := netip.ParseAddrPort(c.Addr)
+		if err != nil || ap.Port() == 0 {
+			return nil, fmt.Errorf("candidate addr %q is not ip:port", c.Addr)
+		}
+		switch c.Kind {
+		case "lan", "stun":
+		default:
+			return nil, fmt.Errorf("candidate kind %q is not lan or stun", c.Kind)
+		}
+		out = append(out, proto.Candidate{Addr: ap.String(), Kind: c.Kind})
+	}
+	return out, nil
+}
+
+// handleHeartbeat refreshes last_seen. It exists so a Node that is not polling
+// the map still counts as online, and so #3 has a cheap liveness channel that
+// does not bump the map version.
+func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	node, ok := s.requireNode(w, r)
+	if !ok {
+		return
+	}
+	if err := s.touchNode(node.ID, s.now()); err != nil {
+		s.fail(w, "touch node", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // buildMap renders the whole Network from one Node's point of view.
 func (s *Server) buildMap(self nodeRow) (proto.PeerMap, error) {
 	nodes, err := s.listNodes()
@@ -219,7 +295,19 @@ func (s *Server) network() proto.Network {
 }
 
 // relays never returns nil, so the JSON is [] rather than null.
-func (s *Server) relays() []proto.Relay { return orEmpty(s.cfg.Relays) }
+// relays stamps the network-wide Relay secret onto every entry. Nodes learn it
+// here, which is what keeps "scan one QR code" true: there is no second
+// credential to paste.
+func (s *Server) relays() []proto.Relay {
+	out := make([]proto.Relay, 0, len(s.cfg.Relays))
+	for _, r := range s.cfg.Relays {
+		if r.Secret == "" {
+			r.Secret = s.RelaySecret
+		}
+		out = append(out, r)
+	}
+	return out
+}
 
 func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 	nodes, err := s.listNodes()

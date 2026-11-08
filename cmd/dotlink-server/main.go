@@ -1,5 +1,5 @@
-// Command dotlink-server runs the Control Plane and, in later tickets, the
-// Relay. Today: `control` to serve the API, `invite` to mint a QR link.
+// Command dotlink-server runs the Control Plane and the Relay: `control` to
+// serve the API, `relay` to forward packets, `invite` to mint a QR link.
 package main
 
 import (
@@ -10,11 +10,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Zane-SI/dotlink/internal/control"
 	"github.com/Zane-SI/dotlink/internal/proto"
+	"github.com/Zane-SI/dotlink/internal/relay"
 )
 
 func main() {
@@ -26,6 +29,8 @@ func main() {
 	switch os.Args[1] {
 	case "control":
 		err = runControl(os.Args[2:])
+	case "relay":
+		err = runRelay(os.Args[2:])
 	case "invite":
 		err = runInvite(os.Args[2:])
 	case "-h", "--help", "help":
@@ -46,6 +51,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `dotlink-server — Dotlink Control Plane
 
   dotlink-server control [flags]   serve the API
+  dotlink-server relay   [flags]   run the UDP Relay
   dotlink-server invite  [flags]   mint a one-shot invite link
 
 Run "dotlink-server <command> -h" for flags.
@@ -108,6 +114,10 @@ func runControl(args []string) error {
 		fmt.Printf("admin token: %s\n", srv.AdminToken)
 		fmt.Println("             generated once and stored in the database; save it now")
 	}
+	if srv.GeneratedRelaySecret && len(cfg.Relays) > 0 {
+		fmt.Println("relay secret generated and stored in the database;")
+		fmt.Println("             `dotlink-server relay -db " + *db + "` picks it up automatically")
+	}
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", *addr, err)
@@ -119,6 +129,46 @@ func runControl(args []string) error {
 		return httpSrv.ServeTLS(ln, *tlsCert, *tlsKey)
 	}
 	return httpSrv.Serve(ln)
+}
+
+func runRelay(args []string) error {
+	fs := flag.NewFlagSet("relay", flag.ExitOnError)
+	db := fs.String("db", "dotlink.db", "Control Plane database to read the Relay secret from")
+	secret := fs.String("secret", "", "Relay secret (defaults to the one stored in -db)")
+	udp := fs.String("udp", ":3478", "UDP listen address Agents reach")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	s := *secret
+	if s == "" {
+		var err error
+		s, err = control.RelaySecretFromDB(*db)
+		if err != nil {
+			return fmt.Errorf("%w (or pass -secret)", err)
+		}
+	}
+
+	pc, err := net.ListenPacket("udp", *udp)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", *udp, err)
+	}
+	defer pc.Close()
+
+	srv := &relay.Server{Secret: []byte(s)}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(pc) }()
+	fmt.Printf("relay listening on %s\n", pc.LocalAddr())
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errc:
+		return err
+	}
 }
 
 func runInvite(args []string) error {

@@ -1,0 +1,221 @@
+package agent
+
+import (
+	"context"
+	"log/slog"
+	"net"
+	"net/http/httptest"
+	"net/netip"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"golang.zx2c4.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/tun/tuntest"
+
+	"github.com/Zane-SI/dotlink/internal/control"
+	"github.com/Zane-SI/dotlink/internal/netcfg"
+	"github.com/Zane-SI/dotlink/internal/proto"
+	"github.com/Zane-SI/dotlink/internal/relay"
+)
+
+const testAdmin = "dlk_adm_daemon_test"
+
+// rig is one Control Plane plus one Relay, both on loopback.
+type rig struct {
+	server *httptest.Server
+	relay  *net.UDPConn
+	addr   netip.AddrPort
+	secret string
+}
+
+func newRig(t *testing.T) *rig {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("relay socket: %v", err)
+	}
+	addr := pc.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	ctl, err := control.Open(control.Config{
+		DBPath:          filepath.Join(t.TempDir(), "dotlink.db"),
+		AdminToken:      testAdmin,
+		PublicURL:       "http://127.0.0.1:1",
+		Relays:          []proto.Relay{{ID: "relay-1", UDP: addr.String()}},
+		LongPollTimeout: 300 * time.Millisecond,
+		Logger:          quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("control plane: %v", err)
+	}
+	// The Relay must check HELLOs against the secret the Control Plane hands
+	// out in the map, so it can only start once that secret exists.
+	srv := &relay.Server{Secret: []byte(ctl.RelaySecret), Logger: quietLogger()}
+	go func() { _ = srv.Serve(pc) }()
+	t.Cleanup(func() { pc.Close() })
+
+	ts := httptest.NewServer(ctl)
+	t.Cleanup(func() { ts.Close(); ctl.Close() })
+	return &rig{server: ts, relay: pc.(*net.UDPConn), addr: addr, secret: ctl.RelaySecret}
+}
+
+// join enrolls a Node against the rig and returns its saved state plus a home
+// directory for the status snapshot.
+func (r *rig) join(t *testing.T, hostname string) (State, string) {
+	t.Helper()
+	inv, err := control.NewAdmin(r.server.URL, testAdmin).CreateInvite(context.Background())
+	if err != nil {
+		t.Fatalf("create invite for %s: %v", hostname, err)
+	}
+	st, err := Enroll(context.Background(), EnrollLink{Server: r.server.URL, Invite: inv.Token}, hostname, "darwin")
+	if err != nil {
+		t.Fatalf("enroll %s: %v", hostname, err)
+	}
+	return st, t.TempDir()
+}
+
+// start runs a Daemon with a fake TUN and no root-only steps.
+func start(t *testing.T, st State, home string) (chan error, *tuntest.ChannelTUN) {
+	t.Helper()
+	ch := tuntest.NewChannelTUN()
+	d := &Daemon{
+		State:         st,
+		Home:          home,
+		UDPListen:     "127.0.0.1:0",
+		HelloInterval: 200 * time.Millisecond,
+		MakeTUN:       func(int) (tun.Device, error) { return ch.TUN(), nil },
+		Configure:     func(context.Context, netcfg.Config) error { return nil },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() { errc <- d.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-errc })
+	return errc, ch
+}
+
+func TestDaemonCarriesAPingBetweenTwoAgents(t *testing.T) {
+	r := newRig(t)
+	mini, miniHome := r.join(t, "mac-mini")
+	book, bookHome := r.join(t, "macbook")
+
+	_, miniCh := start(t, mini, miniHome)
+	_, bookCh := start(t, book, bookHome)
+
+	download := tuntest.Ping(netip.MustParseAddr(book.IPv4), netip.MustParseAddr(mini.IPv4))
+	if got := deliver(t, miniCh, bookCh, download, 10*time.Second); string(got) != string(download) {
+		t.Fatalf("macbook got %d bytes, want the %d sent", len(got), len(download))
+	}
+
+	rt, err := LoadRuntimeIn(bookHome)
+	if err != nil {
+		t.Fatalf("status snapshot: %v", err)
+	}
+	if len(rt.Peers) != 1 || rt.Peers[0].Hostname != "mac-mini" {
+		t.Fatalf("peers = %+v, want mac-mini", rt.Peers)
+	}
+	if rt.Peers[0].Path != "Relayed" {
+		t.Errorf("path = %q, want Relayed: there is no direct path until #3", rt.Peers[0].Path)
+	}
+}
+
+func TestDaemonPublishesItsLanCandidate(t *testing.T) {
+	r := newRig(t)
+	mini, miniHome := r.join(t, "mac-mini")
+	book, bookHome := r.join(t, "macbook")
+	start(t, mini, miniHome)
+	start(t, book, bookHome)
+
+	// The candidate lands in the Map, which is how #3 will find peers to punch.
+	// It is published asynchronously, so poll instead of racing it.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		pm, err := book.Control().Map(context.Background(), -1)
+		if err != nil || pm == nil {
+			t.Fatalf("map: %v", err)
+		}
+		for _, peer := range pm.Peers {
+			if peer.Hostname != "mac-mini" {
+				continue
+			}
+			for _, c := range peer.Candidates {
+				if c.Kind == "lan" {
+					return
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("mac-mini published no lan candidate: %+v", pm.Peers)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestDaemonSurvivesTheRelayVanishing(t *testing.T) {
+	r := newRig(t)
+	mini, miniHome := r.join(t, "mac-mini")
+	book, bookHome := r.join(t, "macbook")
+
+	errc, miniCh := start(t, mini, miniHome)
+	_, bookCh := start(t, book, bookHome)
+	deliver(t, miniCh, bookCh, tuntest.Ping(netip.MustParseAddr(book.IPv4), netip.MustParseAddr(mini.IPv4)), 10*time.Second)
+
+	r.relay.Close()
+	time.Sleep(600 * time.Millisecond)
+
+	select {
+	case err := <-errc:
+		t.Fatalf("the tunnel died with the Relay: %v", err)
+	default:
+	}
+}
+
+func TestRelayRestartRestoresTraffic(t *testing.T) {
+	r := newRig(t)
+	mini, miniHome := r.join(t, "mac-mini")
+	book, bookHome := r.join(t, "macbook")
+
+	_, miniCh := start(t, mini, miniHome)
+	_, bookCh := start(t, book, bookHome)
+	deliver(t, miniCh, bookCh, tuntest.Ping(netip.MustParseAddr(book.IPv4), netip.MustParseAddr(mini.IPv4)), 10*time.Second)
+
+	addr := r.relay.LocalAddr().String()
+	r.relay.Close()
+	time.Sleep(300 * time.Millisecond)
+
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		t.Skipf("could not rebind the Relay port %s: %v", addr, err)
+	}
+	srv := &relay.Server{Secret: []byte(r.secret), Logger: quietLogger()}
+	go func() { _ = srv.Serve(pc) }()
+	t.Cleanup(func() { pc.Close() })
+
+	// No restart of the Agents: their HELLOs rebuild the Relay's table.
+	deliver(t, miniCh, bookCh, tuntest.Ping(netip.MustParseAddr(book.IPv4), netip.MustParseAddr(mini.IPv4)), 15*time.Second)
+}
+
+// deliver pushes packet into A's TUN until B receives something, and returns
+// what B got. WireGuard needs a handshake before the first packet lands, so a
+// single push can be swallowed.
+func deliver(t *testing.T, a, b *tuntest.ChannelTUN, packet []byte, within time.Duration) []byte {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		select {
+		case a.Outbound <- packet:
+		default:
+			// The send queue is full; the device is busy, try again.
+		}
+		select {
+		case got := <-b.Inbound:
+			return got
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatalf("no packet arrived within %s", within)
+	return nil
+}
+
+func quietLogger() *slog.Logger {
+	return slog.New(slog.DiscardHandler)
+}
