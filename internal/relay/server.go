@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/Zane-SI/dotlink/internal/stun"
 )
 
 // Defaults chosen so that a Relay restart is invisible: an Agent re-registers
@@ -82,6 +84,15 @@ func (s *Server) Serve(pc net.PacketConn) error {
 }
 
 func (s *Server) handle(pc net.PacketConn, f []byte, from netip.AddrPort) {
+	// The Relay doubles as the STUN server: it is the one address every Agent
+	// is already talking to, and the mapping it reports is the mapping the
+	// punch will reuse.
+	if stun.IsBindingRequest(f) {
+		if reply := stun.Reply(f, from); reply != nil {
+			_, _ = pc.WriteTo(reply, net.UDPAddrFromAddrPort(from))
+		}
+		return
+	}
 	kind, ok := KindOf(f)
 	if !ok {
 		// Not ours: a misrouted WireGuard packet or a scanner. Ignore.

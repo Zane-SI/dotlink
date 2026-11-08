@@ -22,7 +22,7 @@ const (
 	// Magic marks every frame a Dotlink Agent or Relay produces. It is
 	// deliberately one byte away from WireGuard's own framing so that a
 	// misrouted WireGuard packet can never be mistaken for a Relay frame.
-	Magic = "DLK1"
+	Magic = "DLKR"
 
 	// Version of the frame layout. Bumped when the body layout changes.
 	Version byte = 1

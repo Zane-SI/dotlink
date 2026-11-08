@@ -88,7 +88,7 @@ func TestDataRoundTrip(t *testing.T) {
 func TestParseDataRejects(t *testing.T) {
 	for _, f := range [][]byte{
 		nil,
-		[]byte("DLK1"),
+		[]byte("DLKR"),
 		Hello(nil, key(1), now, []byte("s")),
 		Data(nil, key(1), nil)[:len(Data(nil, key(1), nil))-1],
 	} {

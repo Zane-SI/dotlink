@@ -113,8 +113,10 @@ func TestDaemonCarriesAPingBetweenTwoAgents(t *testing.T) {
 	if len(rt.Peers) != 1 || rt.Peers[0].Hostname != "mac-mini" {
 		t.Fatalf("peers = %+v, want mac-mini", rt.Peers)
 	}
-	if rt.Peers[0].Path != "Relayed" {
-		t.Errorf("path = %q, want Relayed: there is no direct path until #3", rt.Peers[0].Path)
+	// The path may already be Direct by now: punching starts on the first
+	// packet. What matters here is that the snapshot names the peer at all.
+	if rt.Peers[0].Path == "" {
+		t.Errorf("path = %q, want a state", rt.Peers[0].Path)
 	}
 }
 
@@ -192,6 +194,36 @@ func TestRelayRestartRestoresTraffic(t *testing.T) {
 
 	// No restart of the Agents: their HELLOs rebuild the Relay's table.
 	deliver(t, miniCh, bookCh, tuntest.Ping(netip.MustParseAddr(book.IPv4), netip.MustParseAddr(mini.IPv4)), 15*time.Second)
+}
+
+func TestTwoAgentsOnOneLanGoDirectAndSurviveTheRelay(t *testing.T) {
+	r := newRig(t)
+	mini, miniHome := r.join(t, "mac-mini")
+	book, bookHome := r.join(t, "macbook")
+
+	_, miniCh := start(t, mini, miniHome)
+	_, bookCh := start(t, book, bookHome)
+	deliver(t, miniCh, bookCh, tuntest.Ping(netip.MustParseAddr(book.IPv4), netip.MustParseAddr(mini.IPv4)), 10*time.Second)
+
+	// Both agents advertise 127.0.0.1 as a lan candidate here, which is the
+	// same shape as two machines on one wifi: the probe is answered directly.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		rt, err := LoadRuntimeIn(bookHome)
+		if err == nil && len(rt.Peers) == 1 && rt.Peers[0].Path == "Direct" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("path never became Direct: %+v", rt.Peers)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// The proof that the path is real and not a status field: kill the Relay
+	// and keep talking.
+	r.relay.Close()
+	time.Sleep(200 * time.Millisecond)
+	deliver(t, miniCh, bookCh, tuntest.Ping(netip.MustParseAddr(book.IPv4), netip.MustParseAddr(mini.IPv4)), 10*time.Second)
 }
 
 // deliver pushes packet into A's TUN until B receives something, and returns

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -56,7 +57,7 @@ func newTestTunnelNode(t *testing.T, name string, ip string, relayAddr netip.Add
 	if err != nil {
 		t.Fatalf("relay client %s: %v", name, err)
 	}
-	bind := NewBind(client)
+	bind := NewBind(client, nil)
 	tuntestCh := tuntest.NewChannelTUN()
 	dev, err := New(tuntestCh.TUN(), bind, DeviceConfig{
 		PrivateKey: priv,
@@ -158,5 +159,88 @@ func TestDeviceDropsPacketsBeforeRegistration(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if n.client.Registered() {
 		t.Fatal("registered with a relay that does not exist")
+	}
+}
+
+// flipRouter is a Router whose answer the test controls.
+type flipRouter struct {
+	mu      sync.Mutex
+	addr    netip.AddrPort
+	touches int
+}
+
+func (f *flipRouter) Route([32]byte) (netip.AddrPort, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.addr, f.addr.IsValid()
+}
+
+func (f *flipRouter) Touch([32]byte) {
+	f.mu.Lock()
+	f.touches++
+	f.mu.Unlock()
+}
+
+func (f *flipRouter) set(addr netip.AddrPort) {
+	f.mu.Lock()
+	f.addr = addr
+	f.mu.Unlock()
+}
+
+func TestBindSendsToTheDirectAddressOnceThePathIsUp(t *testing.T) {
+	relayAddr := startTestRelay(t)
+	node, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client socket: %v", err)
+	}
+	defer node.Close()
+	client, err := relay.NewClient(node, relay.Config{
+		Relay: relayAddr, Pub: [32]byte{7}, Secret: []byte(testSecret),
+		Logger: slog.New(slog.DiscardHandler), HelloInterval: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer client.Close()
+
+	// The far side of the punch: a plain UDP socket standing in for a peer.
+	peer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("peer socket: %v", err)
+	}
+	defer peer.Close()
+	peerAddr := peer.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	router := &flipRouter{}
+	bind := NewBind(client, router)
+	key := [32]byte{9}
+	ep, err := bind.ParseEndpoint(RelayEndpoint(key))
+	if err != nil {
+		t.Fatalf("endpoint: %v", err)
+	}
+
+	// Before the punch the packet goes to the Relay, which has no such peer
+	// registered: nobody receives it. That is the point — it is not direct.
+	if err := bind.Send([][]byte{[]byte("via-relay")}, ep); err != nil {
+		t.Fatalf("send relayed: %v", err)
+	}
+
+	router.set(peerAddr)
+	if err := bind.Send([][]byte{[]byte("direct!")}, ep); err != nil {
+		t.Fatalf("send direct: %v", err)
+	}
+	buf := make([]byte, 64)
+	if err := peer.(*net.UDPConn).SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err := peer.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("the peer never saw the direct packet: %v", err)
+	}
+	if string(buf[:n]) != "direct!" {
+		t.Fatalf("peer got %q", buf[:n])
+	}
+	if router.touches == 0 {
+		t.Fatal("a send did not tell the router that traffic wants the peer")
 	}
 }

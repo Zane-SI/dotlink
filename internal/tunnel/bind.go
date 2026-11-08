@@ -27,13 +27,24 @@ const keyPrefix = "pk:"
 // a successful hole punch is immediately usable by WireGuard.
 type Bind struct {
 	client *relay.Client
+	router Router
 
 	mu     sync.Mutex
 	closed chan struct{}
 }
 
-func NewBind(c *relay.Client) *Bind {
-	return &Bind{client: c}
+// Router answers "does this peer have a direct path right now?". It is
+// implemented by punch.Manager; a nil Router means every peer goes through the
+// Relay, which is what the tests that only exercise the Relay use.
+type Router interface {
+	// Route returns the direct address for key, if one is in place.
+	Route(key [32]byte) (netip.AddrPort, bool)
+	// Touch records that traffic wants to reach key, starting a punch.
+	Touch(key [32]byte)
+}
+
+func NewBind(c *relay.Client, router Router) *Bind {
+	return &Bind{client: c, router: router}
 }
 
 // Open hands WireGuard a receive function wired to the Relay. The socket
@@ -87,8 +98,24 @@ func (b *Bind) receive(done <-chan struct{}, buffers [][]byte, sizes []int, eps 
 func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	switch e := ep.(type) {
 	case *keyEndpoint:
+		// The path can change between any two packets, so every send asks the
+		// router. Nothing is reconfigured: the peer stays "pk:<hex>" in
+		// WireGuard's bookkeeping and only this hop knows where it goes.
+		if b.router != nil {
+			b.router.Touch(e.key)
+		}
+		var direct netip.AddrPort
+		if b.router != nil {
+			direct, _ = b.router.Route(e.key)
+		}
 		for _, buf := range bufs {
-			if err := b.client.SendTo(e.key, buf); err != nil {
+			var err error
+			if direct.IsValid() {
+				err = b.client.SendToAddr(direct, buf)
+			} else {
+				err = b.client.SendTo(e.key, buf)
+			}
+			if err != nil {
 				return err
 			}
 		}

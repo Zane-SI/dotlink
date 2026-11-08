@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+
+	"github.com/Zane-SI/dotlink/internal/stun"
 	"time"
 )
 
@@ -35,18 +37,32 @@ type Config struct {
 	Now           func() time.Time
 }
 
+// ProbeHandler takes a hole-punching probe that arrived on the socket. Probes
+// are magic-prefixed, so the data path can tell them from WireGuard packets
+// before WireGuard ever sees them.
+type ProbeHandler func(from netip.AddrPort, frame []byte)
+
+// stunWait is one outstanding STUN transaction: the request whose transaction
+// ID must match the answer, and where to put the result.
+type stunWait struct {
+	request []byte
+	reply   chan netip.AddrPort
+}
+
 // Client keeps an Agent registered with a Relay and moves frames both ways.
 //
 // Registration is periodic on purpose: a Relay that restarts forgets its
 // table, and the next HELLO puts us back in it. That is the whole reconnect
 // story — no handshakes, no backoff, no state to lose.
 type Client struct {
-	cfg     Config
-	pc      net.PacketConn
-	log     *slog.Logger
-	packets chan Packet
-	done    chan struct{}
-	once    sync.Once
+	cfg         Config
+	pc          net.PacketConn
+	log         *slog.Logger
+	packets     chan Packet
+	probes      ProbeHandler
+	pendingSTUN *stunWait
+	done        chan struct{}
+	once        sync.Once
 
 	mu         sync.Mutex
 	registered bool
@@ -83,6 +99,14 @@ func NewClient(pc net.PacketConn, cfg Config) (*Client, error) {
 
 func (c *Client) Packets() <-chan Packet { return c.packets }
 
+// SetProbeHandler installs the sink for hole-punching probes. It may be called
+// after New: the read loop checks the field on every packet.
+func (c *Client) SetProbeHandler(h ProbeHandler) {
+	c.mu.Lock()
+	c.probes = h
+	c.mu.Unlock()
+}
+
 func (c *Client) LocalAddr() netip.AddrPort {
 	ap, _ := addrPort(c.pc.LocalAddr())
 	return ap
@@ -100,6 +124,37 @@ func (c *Client) LastOK() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lastOK
+}
+
+// DiscoverMapped asks the Relay what address it sees us coming from. The
+// answer is our public UDP mapping, which is exactly the candidate a peer on
+// another network has to aim at.
+func (c *Client) DiscoverMapped(wait time.Duration) (netip.AddrPort, error) {
+	req := stun.Request()
+	if req == nil {
+		return netip.AddrPort{}, errors.New("relay: cannot build a STUN request")
+	}
+	ch := make(chan netip.AddrPort, 1)
+	c.mu.Lock()
+	c.pendingSTUN = &stunWait{request: req, reply: ch}
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.pendingSTUN = nil
+		c.mu.Unlock()
+	}()
+
+	if _, err := c.pc.WriteTo(req, net.UDPAddrFromAddrPort(c.cfg.Relay)); err != nil {
+		return netip.AddrPort{}, err
+	}
+	select {
+	case addr := <-ch:
+		return addr, nil
+	case <-time.After(wait):
+		return netip.AddrPort{}, errors.New("relay: no STUN answer in time")
+	case <-c.done:
+		return netip.AddrPort{}, net.ErrClosed
+	}
 }
 
 // SendTo sends payload to key through the Relay.
@@ -163,6 +218,29 @@ func (c *Client) readLoop() {
 
 // dispatch handles one datagram and reports whether the loop should continue.
 func (c *Client) dispatch(f []byte, from netip.AddrPort) bool {
+	if len(f) >= 4 && f[0] == 'D' && f[1] == 'L' && f[2] == 'K' && f[3] == '1' {
+		c.mu.Lock()
+		h := c.probes
+		c.mu.Unlock()
+		if h != nil {
+			h(from, f)
+		}
+		return true
+	}
+	if stun.IsBindingSuccess(f) {
+		c.mu.Lock()
+		pending := c.pendingSTUN
+		c.mu.Unlock()
+		if pending != nil {
+			if addr, err := stun.ParseResponse(f, pending.request); err == nil {
+				select {
+				case pending.reply <- addr:
+				default:
+				}
+			}
+		}
+		return true
+	}
 	kind, isOurs := KindOf(f)
 	if !isOurs {
 		return c.deliver(Packet{Addr: from, Payload: f, Relay: false})

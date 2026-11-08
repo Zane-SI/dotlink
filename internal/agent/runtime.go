@@ -23,7 +23,8 @@ type Runtime struct {
 type RuntimePeer struct {
 	Hostname string `json:"hostname"`
 	IPv4     string `json:"ipv4"`
-	Path     string `json:"path"` // Relayed until #3 teaches us Direct
+	Path     string `json:"path"`             // Relayed until a punch lands, then Direct
+	RTTms    int64  `json:"rtt_ms,omitempty"` // only meaningful on a direct path
 }
 
 // RuntimePath is where the daemon leaves its snapshot.
