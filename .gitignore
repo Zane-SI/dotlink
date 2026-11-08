@@ -1,0 +1,29 @@
+# Go
+/dotlink-server
+/dotlink-agent
+*.test
+*.out
+
+# 构建产物
+/build/
+/dist/
+
+# 本地配置与数据
+*.local.toml
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# 证书与密钥
+*.pem
+*.key
+!docs/**/*.pem
+
+# macOS
+.DS_Store
+
+# Xcode / iOS
+ios/build/
+ios/*.xcworkspace/xcuserdata/
+ios/DerivedData/
