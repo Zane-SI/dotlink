@@ -44,6 +44,9 @@ type Status struct {
 	CanInvite bool `json:"can_invite"`
 	// Network is the network name shown next to the QR code.
 	Network string `json:"network,omitempty"`
+	// AdvertiseRoutes are the LANs this Agent forwards for, if it is a
+	// Subnet Router. Empty means it is an ordinary Node.
+	AdvertiseRoutes []string `json:"advertise_routes,omitempty"`
 	// Error is the last reason the tunnel is not running, if any.
 	Error string `json:"error,omitempty"`
 

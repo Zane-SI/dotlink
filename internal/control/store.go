@@ -98,7 +98,10 @@ func newToken(prefix string, nbytes int) (string, error) {
 }
 
 func (s *Server) openDB(path string) error {
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	// _txlock=immediate takes the write lock when a transaction starts. The
+	// transactions here all read first and write after; a deferred upgrade
+	// cannot wait out a concurrent writer and fails at once with SQLITE_BUSY.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate")
 	if err != nil {
 		return fmt.Errorf("open sqlite: %w", err)
 	}

@@ -17,10 +17,23 @@ import (
 // Runner runs one command. Tests substitute a recorder.
 type Runner interface {
 	Run(ctx context.Context, name string, args ...string) error
+	// Output is Run plus stdout. Route lookups need the answer, not just the
+	// exit status; keeping it on the same interface means tests fake one
+	// thing instead of two.
+	Output(ctx context.Context, name string, args ...string) (string, error)
 }
 
 // ExecRunner runs real commands.
 type ExecRunner struct{}
+
+// Output returns what the command printed, even when it failed: `route -n
+// get` reports "not in table" on stderr and exits non-zero, and the caller
+// needs to tell "no route" apart from "route command missing".
+func (ExecRunner) Output(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
 
 func (ExecRunner) Run(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -65,25 +78,77 @@ func Configure(ctx context.Context, r Runner, c Config) error {
 	if c.IPv6.IsValid() {
 		steps = append(steps, []string{"ifconfig", c.Name, "inet6", c.IPv6.String(), "prefixlen", fmt.Sprint(c.IPv6Net.Bits())})
 	}
-	for _, p := range c.Routes {
-		steps = append(steps, routeAdd(c.Name, p))
-	}
 	for _, s := range steps {
 		if err := r.Run(ctx, s[0], s[1:]...); err != nil {
 			return fmt.Errorf("netcfg: %w", err)
 		}
 	}
+	// Routes go through AddRoute so a route that already exists is success, not
+	// a dead session: a restart would otherwise fail on "File exists" forever.
+	for _, p := range c.Routes {
+		if err := AddRoute(ctx, r, c.Name, p); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func routeAdd(iface string, p netip.Prefix) []string {
-	args := []string{"-n", "add"}
+// routeArgs is the one spelling both install and removal use: `route` takes
+// -net for IPv4 and -inet6 for IPv6, and the destination must be masked or
+// the kernel rejects the entry.
+func routeArgs(action, iface string, p netip.Prefix) []string {
+	args := []string{"-n", action}
 	if p.Addr().Is4() {
-		args = append(args, "-net", p.String())
+		args = append(args, "-net", p.Masked().String())
 	} else {
-		args = append(args, "-inet6", p.String())
+		args = append(args, "-inet6", p.Masked().String())
 	}
-	return append([]string{"route"}, append(args, "-interface", iface)...)
+	return append(args, "-interface", iface)
+}
+
+// AddRoute points a subnet the peers advertise at this Node's TUN. The map
+// changes at runtime, so this is separate from the routes Configure installs
+// at startup.
+//
+// The route already being there is success only when it points at our TUN:
+// route(8) answers "File exists" and the goal of an add is that the route
+// exists. If the kernel would use another interface, the LAN is already local
+// (or another Gateway's), and shadowing it would silently send the traffic
+// the wrong way; that is a clear error instead.
+func AddRoute(ctx context.Context, r Runner, iface string, p netip.Prefix) error {
+	if !p.IsValid() || iface == "" {
+		return fmt.Errorf("netcfg: add route needs an interface and a prefix")
+	}
+	if err := r.Run(ctx, "route", routeArgs("add", iface, p)...); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "file exists") {
+			existing, lookupErr := RouteInterface(ctx, r, p)
+			if lookupErr != nil {
+				return fmt.Errorf("netcfg: add route %s: route exists but its interface could not be read: %w", p, lookupErr)
+			}
+			if existing != "" && existing != iface {
+				return fmt.Errorf("netcfg: route %s already exists on %s, not %s; refusing to shadow it", p, existing, iface)
+			}
+			return nil
+		}
+		return fmt.Errorf("netcfg: add route %s: %w", p, err)
+	}
+	return nil
+}
+
+// DeleteRoute removes a route AddRoute installed. A route that is already
+// gone is success: the goal is that it is gone, and route(8) says "not in
+// table" when there was nothing to remove.
+func DeleteRoute(ctx context.Context, r Runner, iface string, p netip.Prefix) error {
+	if !p.IsValid() || iface == "" {
+		return fmt.Errorf("netcfg: delete route needs an interface and a prefix")
+	}
+	if err := r.Run(ctx, "route", routeArgs("delete", iface, p)...); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "not in table") {
+			return nil
+		}
+		return fmt.Errorf("netcfg: delete route %s: %w", p, err)
+	}
+	return nil
 }
 
 // netmask renders a prefix as a dotted netmask, which is the only form

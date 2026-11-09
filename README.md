@@ -36,6 +36,20 @@ sudo ./bin/dotlink-agent up
 
 菜单栏客户端：`/Applications/Dotlink.app`（`sudo packaging/macos/install.sh` 安装），生成二维码、看直连/中继、断开与重连。
 
+## Subnet Router（Gateway）
+
+默认 Agent 只把自己放进 Overlay。要让别的 Node 访问这台机器所在的局域网，启动时**必须**加 `--advertise-routes`：
+
+```sh
+sudo ./bin/dotlink-agent up --advertise-routes=192.168.1.0/24
+```
+
+这个 flag 只在 Agent 的启动命令上生效，launchd 拉起的那条命令也要带上，否则重启后就是普通 Node（同时撤销上一次的通告）。打包里的 launchd plist 还没有这个开关，属于后续工作；目前需要手动写进本机 plist，或者直接前台运行。
+
+通告被拒绝时（例如与别的 Gateway 的 409 冲突），Agent 会报错并保持停止，而不是每两秒重试；解决冲突后重新连接即可。
+
+Subnet Router 目前只在 macOS 上可用；Linux 及其他平台带 `--advertise-routes` 启动时会直接报 “not implemented”。
+
 ## 文档
 
 - [`GLOSSARY.md`](GLOSSARY.md) — 术语表，读代码前先读这个
@@ -47,6 +61,7 @@ sudo ./bin/dotlink-agent up
 - 任一侧是 hard NAT（对称 NAT / CGNAT / 移动网络）时打洞基本失败，只能走中继。
 - DERP 兼容中继是 TCP-over-TCP，单流吞吐有天花板，只能当退路。
 - iOS 客户端只走 TestFlight（App Store 审核指南 5.4 要求 VPN 类应用由 organization 账号提供）。
+- Subnet Router 目前只在 macOS 上实现；Linux 及其他平台带 `--advertise-routes` 启动时会报 “not implemented”。
 
 ## 许可证
 

@@ -255,6 +255,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.handlePostCandidates(w, r)
 
+	case path == "/v1/routes":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		s.handlePostRoutes(w, r)
+
 	case path == "/v1/heartbeat":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)

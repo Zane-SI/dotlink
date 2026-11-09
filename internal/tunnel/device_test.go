@@ -63,7 +63,7 @@ func TestPeerOpsRewritesAllowedIPsWithoutDroppingTheSession(t *testing.T) {
 		Prefixes: []netip.Prefix{prefix("100.64.0.2/32"), prefix("192.168.1.0/24")},
 	}})
 
-	if !strings.Contains(ops, "remove_allowed_ips=true") {
+	if !strings.Contains(ops, "replace_allowed_ips=true") {
 		t.Errorf("stale prefixes would survive:\n%s", ops)
 	}
 	if strings.Contains(ops, "endpoint=") || strings.Contains(ops, "remove=true") {

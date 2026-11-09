@@ -2,6 +2,7 @@ package control
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -698,5 +699,273 @@ func TestMapCarriesTheDNSLabel(t *testing.T) {
 	}
 	if got := pm.Self.DNSName; got != "macbook" {
 		t.Fatalf("self dns_name = %q, want macbook", got)
+	}
+}
+
+func TestRoutesReachPeersAndRefuseConflicts(t *testing.T) {
+	e := newTestEnv(t)
+	gateway := e.joinNode(t, "gateway")
+	book := e.joinNode(t, "macbook")
+	other := e.joinNode(t, "pi")
+
+	post := func(token string, routes ...string) (*http.Response, string) {
+		var body struct {
+			Error string `json:"error"`
+		}
+		resp := e.call(t, http.MethodPost, "/v1/routes", token, map[string]any{"routes": routes}, &body)
+		return resp, body.Error
+	}
+
+	if resp, msg := post(gateway.NodeToken, "192.168.1.5/24"); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("advertise: status = %d (%s)", resp.StatusCode, msg)
+	}
+
+	// The advertisement was stored masked, so peers get a usable route.
+	var pm proto.PeerMap
+	if resp := e.call(t, http.MethodGet, "/v1/map?since=0", book.NodeToken, nil, &pm); resp.StatusCode != http.StatusOK {
+		t.Fatalf("map: status = %d", resp.StatusCode)
+	}
+	if len(pm.Peers) != 2 {
+		t.Fatalf("peers = %d", len(pm.Peers))
+	}
+	var got []string
+	for _, p := range pm.Peers {
+		if p.Hostname == "gateway" {
+			got = p.SubnetRoutes
+		}
+	}
+	if len(got) != 1 || got[0] != "192.168.1.0/24" {
+		t.Fatalf("gateway routes = %v, want [192.168.1.0/24]", got)
+	}
+
+	// A second Gateway for the same LAN is refused, and the message names the
+	// machine that already holds it: otherwise the operator has two boxes and
+	// no way to tell which one to fix.
+	var before proto.PeerMap
+	if resp := e.call(t, http.MethodGet, "/v1/map?since=0", book.NodeToken, nil, &before); resp.StatusCode != http.StatusOK {
+		t.Fatalf("map before conflict: status = %d", resp.StatusCode)
+	}
+	resp, msg := post(other.NodeToken, "192.168.0.0/16")
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("overlapping route: status = %d, want 409", resp.StatusCode)
+	}
+	if !strings.Contains(msg, gateway.NodeID) || !strings.Contains(msg, "gateway") {
+		t.Fatalf("conflict message %q does not name the holder", msg)
+	}
+	if !strings.Contains(msg, other.NodeID) || !strings.Contains(msg, "pi") {
+		t.Fatalf("conflict message %q does not name the requester", msg)
+	}
+	// The conflict is an overlap, not an exact match: the message must name
+	// both so the operator knows which LAN to free and what was attempted.
+	if !strings.Contains(msg, "192.168.1.0/24") {
+		t.Fatalf("conflict message %q does not name the holder's route", msg)
+	}
+	if !strings.Contains(msg, "192.168.0.0/16") {
+		t.Fatalf("conflict message %q does not name the attempted route", msg)
+	}
+
+	// A refused advertisement changes nothing: the loser keeps no routes and
+	// no peer is told to send LAN traffic to it. The version staying put is
+	// what keeps every Agent from re-polling a map that did not change.
+	var after proto.PeerMap
+	if resp := e.call(t, http.MethodGet, "/v1/map?since=0", book.NodeToken, nil, &after); resp.StatusCode != http.StatusOK {
+		t.Fatalf("map after conflict: status = %d", resp.StatusCode)
+	}
+	if after.Version != before.Version {
+		t.Fatalf("a refused advertisement bumped the version %d -> %d", before.Version, after.Version)
+	}
+	for _, p := range after.Peers {
+		switch p.Hostname {
+		case "pi":
+			if len(p.SubnetRoutes) != 0 {
+				t.Fatalf("the refused node kept routes: %v", p.SubnetRoutes)
+			}
+		case "gateway":
+			if len(p.SubnetRoutes) != 1 || p.SubnetRoutes[0] != "192.168.1.0/24" {
+				t.Fatalf("gateway routes changed to %v", p.SubnetRoutes)
+			}
+		}
+	}
+
+	// Non-overlapping is fine.
+	if resp, msg := post(other.NodeToken, "10.0.0.0/24"); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("second gateway: status = %d (%s)", resp.StatusCode, msg)
+	}
+
+	// Clearing the claim frees the LAN for the other Gateway.
+	if resp, msg := post(gateway.NodeToken); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("clear: status = %d (%s)", resp.StatusCode, msg)
+	}
+	if resp, msg := post(other.NodeToken, "192.168.1.0/24"); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("take over: status = %d (%s)", resp.StatusCode, msg)
+	}
+}
+
+func TestConcurrentAdvertisementsProduceOneHolder(t *testing.T) {
+	// Two Nodes can see the same LAN free at the same instant. The overlap
+	// check and the write share one transaction (_txlock=immediate), so
+	// exactly one of these may win; anything else means two peers would route
+	// the same LAN to two Gateways.
+	e := newTestEnv(t)
+	const nodes = 8
+	tokens := make([]string, nodes)
+	for i := range tokens {
+		tokens[i] = e.joinNode(t, "node-"+strconv.Itoa(i)).NodeToken
+	}
+
+	type result struct {
+		token  string
+		status int
+		body   string
+	}
+	results := make(chan result, nodes)
+	start := make(chan struct{})
+	client := &http.Client{}
+	for _, token := range tokens {
+		go func(token string) {
+			<-start
+			req, err := http.NewRequest(http.MethodPost, e.base+"/v1/routes", strings.NewReader(`{"routes":["192.168.1.0/24"]}`))
+			if err != nil {
+				results <- result{token: token, body: err.Error()}
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				results <- result{token: token, body: err.Error()}
+				return
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			results <- result{token: token, status: resp.StatusCode, body: string(body)}
+		}(token)
+	}
+	close(start)
+
+	var accepted, conflicts, serverErrors int
+	holder := ""
+	for i := 0; i < nodes; i++ {
+		r := <-results
+		switch {
+		case r.status == http.StatusNoContent:
+			accepted++
+			holder = r.token
+		case r.status == http.StatusConflict:
+			conflicts++
+		case r.status >= 500:
+			serverErrors++
+			t.Errorf("advertisement returned %d: %s", r.status, r.body)
+		default:
+			t.Errorf("advertisement returned %d: %s", r.status, r.body)
+		}
+	}
+	if accepted != 1 || conflicts != nodes-1 || serverErrors != 0 {
+		t.Fatalf("accepted=%d conflicts=%d 5xx=%d, want 1/%d/0", accepted, conflicts, serverErrors, nodes-1)
+	}
+
+	// Read the map as a Node that did not win: the holder is the map's Self
+	// for its own token, and Self carries no route list.
+	viewer := tokens[0]
+	for _, token := range tokens {
+		if token != holder {
+			viewer = token
+			break
+		}
+	}
+	var pm proto.PeerMap
+	if resp := e.call(t, http.MethodGet, "/v1/map?since=0", viewer, nil, &pm); resp.StatusCode != http.StatusOK {
+		t.Fatalf("map: status = %d", resp.StatusCode)
+	}
+	holders := 0
+	for _, p := range pm.Peers {
+		for _, route := range p.SubnetRoutes {
+			if route == "192.168.1.0/24" {
+				holders++
+			}
+		}
+	}
+	if holders != 1 {
+		t.Fatalf("%d peers advertise 192.168.1.0/24, want exactly 1", holders)
+	}
+}
+
+func TestRouteLimit(t *testing.T) {
+	// maxRoutes is a guard against a loop with no base case, but it has to
+	// admit a normal multi-LAN Gateway. The boundary is 16, inclusive.
+	e := newTestEnv(t)
+	node := e.joinNode(t, "gateway")
+
+	routes := make([]string, 0, 17)
+	for i := 0; i < 16; i++ {
+		routes = append(routes, "10."+strconv.Itoa(i)+".0.0/16")
+	}
+	if resp, msg := postRoutes(t, e, node.NodeToken, routes); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("16 routes: status = %d (%s), want 204", resp.StatusCode, msg)
+	}
+	routes = append(routes, "10.16.0.0/16")
+	resp, msg := postRoutes(t, e, node.NodeToken, routes)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("17 routes: status = %d, want 400", resp.StatusCode)
+	}
+	if !strings.Contains(msg, "at most 16") {
+		t.Fatalf("error %q does not say the limit", msg)
+	}
+}
+
+// postRoutes advertises routes and returns the response plus the error body.
+func postRoutes(t *testing.T, e *testEnv, token string, routes []string) (*http.Response, string) {
+	t.Helper()
+	var body struct {
+		Error string `json:"error"`
+	}
+	resp := e.call(t, http.MethodPost, "/v1/routes", token, map[string]any{"routes": routes}, &body)
+	return resp, body.Error
+}
+
+func TestRouteValidation(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     []string
+		want   string // substring of the error, empty means accept
+		expect []string
+	}{
+		{name: "masks the prefix", in: []string{"192.168.1.5/24"}, expect: []string{"192.168.1.0/24"}},
+		{name: "dedupes", in: []string{"10.0.0.0/8", "10.1.2.3/8"}, expect: []string{"10.0.0.0/8"}},
+		{name: "default route", in: []string{"0.0.0.0/0"}, want: "exit nodes are not in v1"},
+		{name: "overlaps overlay v4", in: []string{"100.64.0.0/16"}, want: "overlaps the Overlay range"},
+		{name: "overlaps overlay v6", in: []string{"fd00::/48"}, want: "overlaps the Overlay range"},
+		{name: "not a prefix", in: []string{"192.168.1.1"}, want: "is not a CIDR prefix"},
+		{name: "link local", in: []string{"fe80::/64"}, want: "link-local"},
+		{name: "too broad v4 low", in: []string{"0.0.0.0/1"}, want: "too broad"},
+		{name: "too broad v4 high", in: []string{"128.0.0.0/1"}, want: "too broad"},
+		{name: "too broad v6", in: []string{"::/1"}, want: "too broad"},
+		{name: "unspecified v4", in: []string{"0.0.0.0/8"}, want: "unspecified"},
+		{name: "loopback v4", in: []string{"127.0.0.0/8"}, want: "loopback"},
+		{name: "loopback v6", in: []string{"::1/128"}, want: "loopback"},
+		{name: "link local unicast v4", in: []string{"169.254.0.0/16"}, want: "link-local"},
+		{name: "multicast v4", in: []string{"239.0.0.0/8"}, want: "multicast"},
+		{name: "multicast v6", in: []string{"ff00::/16"}, want: "multicast"},
+		{name: "ipv4 mapped", in: []string{"::ffff:192.168.1.0/120"}, want: "IPv4-mapped"},
+		{name: "accepts a /8", in: []string{"10.0.0.0/8"}, expect: []string{"10.0.0.0/8"}},
+		{name: "accepts a /32", in: []string{"2001:db8::/32"}, expect: []string{"2001:db8::/32"}},
+		{name: "accepts a /64", in: []string{"2001:db8:1::/64"}, expect: []string{"2001:db8:1::/64"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := cleanRoutes(c.in)
+			if c.want != "" {
+				if err == nil || !strings.Contains(err.Error(), c.want) {
+					t.Fatalf("err = %v, want %q", err, c.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if strings.Join(got, ",") != strings.Join(c.expect, ",") {
+				t.Fatalf("got %v, want %v", got, c.expect)
+			}
+		})
 	}
 }

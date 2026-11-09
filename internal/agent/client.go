@@ -74,6 +74,19 @@ func (c *Control) SetCandidates(ctx context.Context, cands []proto.Candidate) er
 	}{cands}, nil)
 }
 
+// SetRoutes advertises the LANs this Node forwards for. An empty slice
+// withdraws a previous advertisement. The Control Plane refuses a LAN another
+// Node already claims, so the error is worth showing verbatim: it names the
+// machine to fix or disable.
+func (c *Control) SetRoutes(ctx context.Context, routes []string) error {
+	if routes == nil {
+		routes = []string{}
+	}
+	// Do already turns a non-2xx into an error carrying the Control Plane's
+	// own message, which is what the operator needs to see.
+	return c.Do(ctx, http.MethodPost, "/v1/routes", map[string]any{"routes": routes}, nil)
+}
+
 // Heartbeat refreshes this Node's last_seen without asking for the map.
 func (c *Control) Heartbeat(ctx context.Context) error {
 	status, err := c.DoStatus(ctx, http.MethodPost, "/v1/heartbeat", nil, nil)

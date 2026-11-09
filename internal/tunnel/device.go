@@ -85,18 +85,23 @@ func (d *Device) Close() { d.dev.Close() }
 
 // Apply brings the peer set up to date with peers, touching only the peers
 // that appeared, disappeared or changed their prefixes.
+//
+// The recorded set advances only after IpcSet succeeds. Releasing the lock
+// early would let a failed apply leave d.peers ahead of the kernel: the retry
+// would then compute an empty op string, report success, and the caller would
+// install a route to a peer that has no AllowedIPs — a silent black hole.
 func (d *Device) Apply(peers []Peer) error {
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	ops, next := peerOps(d.peers, peers)
-	d.peers = next
-	d.mu.Unlock()
-
 	if ops == "" {
+		d.peers = next
 		return nil
 	}
 	if err := d.dev.IpcSet(ops); err != nil {
 		return fmt.Errorf("apply peers: %w", err)
 	}
+	d.peers = next
 	return nil
 }
 
@@ -142,7 +147,10 @@ func peerOps(prev map[[32]byte][]netip.Prefix, peers []Peer) (string, map[[32]by
 				fmt.Fprintf(&b, "allowed_ip=%s\n", prefix)
 			}
 		case !samePrefixes(before, p.Prefixes):
-			fmt.Fprintf(&b, "public_key=%x\nremove_allowed_ips=true\n", p.Pub)
+			// replace_allowed_ips is the UAPI key that clears this peer's
+			// prefixes; there is no "remove_allowed_ips" key, and sending
+			// one fails the whole Apply.
+			fmt.Fprintf(&b, "public_key=%x\nreplace_allowed_ips=true\n", p.Pub)
 			for _, prefix := range p.Prefixes {
 				fmt.Fprintf(&b, "allowed_ip=%s\n", prefix)
 			}

@@ -51,6 +51,7 @@ func (c *LocalControl) Status(context.Context) (ipc.Status, error) {
 	st.Registered = rt.Registered
 	st.RelayUDP = rt.RelayUDP
 	st.RelayMode = rt.RelayMode
+	st.AdvertiseRoutes = append([]string(nil), rt.AdvertiseRoutes...)
 	if rt.Hostname != "" {
 		st.Hostname = rt.Hostname
 	}

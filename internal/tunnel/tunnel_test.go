@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -143,6 +144,67 @@ func TestTwoDevicesExchangePacketsThroughRelay(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no packet arrived at the other side")
+	}
+}
+
+// TestApplyReplacesChangedAllowedIPs is the regression test for the UAPI key
+// the first version of Apply got wrong: a peer whose LAN moved must lose the
+// old AllowedIP, or that LAN keeps travelling into the tunnel.
+func TestApplyReplacesChangedAllowedIPs(t *testing.T) {
+	relayAddr := startTestRelay(t)
+	n := newTestTunnelNode(t, "gateway", "100.64.0.1", relayAddr)
+	_, peer := keypair(t)
+
+	old := netip.MustParsePrefix("192.168.1.0/24")
+	moved := netip.MustParsePrefix("192.168.2.0/24")
+	if err := n.dev.Apply([]Peer{{Pub: peer, Prefixes: []netip.Prefix{old}}}); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	if err := n.dev.Apply([]Peer{{Pub: peer, Prefixes: []netip.Prefix{moved}}}); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+
+	uapi, err := n.dev.Dev().IpcGet()
+	if err != nil {
+		t.Fatalf("IpcGet: %v", err)
+	}
+	if !strings.Contains(uapi, "allowed_ip=192.168.2.0/24") {
+		t.Fatalf("the new LAN is not allowed:\n%s", uapi)
+	}
+	if strings.Contains(uapi, "allowed_ip=192.168.1.0/24") {
+		t.Fatalf("the old LAN is still allowed:\n%s", uapi)
+	}
+}
+
+// TestAFailedApplyKeepsThePreviousPeerSet: the recorded peer set must not run
+// ahead of the kernel. Release the lock before IpcSet and a failed apply leaves
+// d.peers claiming the new prefixes, so the retry computes an empty diff,
+// reports success, and the caller installs a route for a peer with no
+// AllowedIPs — a silent black hole.
+func TestAFailedApplyKeepsThePreviousPeerSet(t *testing.T) {
+	relayAddr := startTestRelay(t)
+	n := newTestTunnelNode(t, "gateway", "100.64.0.1", relayAddr)
+	_, peer := keypair(t)
+
+	old := netip.MustParsePrefix("192.168.1.0/24")
+	moved := netip.MustParsePrefix("192.168.2.0/24")
+	if err := n.dev.Apply([]Peer{{Pub: peer, Prefixes: []netip.Prefix{old}}}); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+
+	// A closed device drops its peers, so the next Apply tries to create the
+	// peer again and fails; that is the IpcSet failure under test. Close is
+	// idempotent, so the t.Cleanup close is harmless.
+	n.dev.Close()
+	if err := n.dev.Apply([]Peer{{Pub: peer, Prefixes: []netip.Prefix{moved}}}); err == nil {
+		t.Fatal("Apply succeeded against a closed device")
+	}
+
+	n.dev.mu.Lock()
+	got := n.dev.peers[peer]
+	n.dev.mu.Unlock()
+	if len(got) != 1 || got[0] != old {
+		t.Fatalf("peer set after a failed Apply = %v, want [%s]", got, old)
 	}
 }
 

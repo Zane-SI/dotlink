@@ -23,9 +23,12 @@ type Runtime struct {
 
 	RelayUDP string `json:"relay_udp"`
 	// RelayMode is "udp" or "derp": which transport relayed traffic uses.
-	RelayMode  string        `json:"relay_mode,omitempty"`
-	Registered bool          `json:"registered"`
-	Peers      []RuntimePeer `json:"peers"`
+	RelayMode string `json:"relay_mode,omitempty"`
+	// AdvertiseRoutes are the LANs this Node forwards for; empty for an
+	// ordinary Node.
+	AdvertiseRoutes []string      `json:"advertise_routes,omitempty"`
+	Registered      bool          `json:"registered"`
+	Peers           []RuntimePeer `json:"peers"`
 }
 
 // RuntimePeer is one Node as this Agent currently reaches it.

@@ -10,19 +10,23 @@ import (
 	"net/netip"
 	"os"
 	goruntime "runtime"
+	"sort"
 	"sync"
 	"time"
 
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 
+	"github.com/Zane-SI/dotlink/internal/ctlapi"
 	"github.com/Zane-SI/dotlink/internal/derp"
 	"github.com/Zane-SI/dotlink/internal/link"
 	"github.com/Zane-SI/dotlink/internal/magicdns"
 	"github.com/Zane-SI/dotlink/internal/netcfg"
+	"github.com/Zane-SI/dotlink/internal/netshare"
 	"github.com/Zane-SI/dotlink/internal/proto"
 	"github.com/Zane-SI/dotlink/internal/punch"
 	"github.com/Zane-SI/dotlink/internal/relay"
+	"github.com/Zane-SI/dotlink/internal/subnet"
 	"github.com/Zane-SI/dotlink/internal/tunnel"
 )
 
@@ -68,6 +72,25 @@ type Daemon struct {
 	// (some carriers never let a mapping through) and skipping it is cheaper
 	// than watching five rounds fail every minute.
 	NoPunch bool
+
+	// AdvertiseRoutes are the LANs this Node forwards for. Empty means this
+	// Node is not a Gateway.
+	AdvertiseRoutes []netip.Prefix
+
+	// EnableNetshare turns on forwarding and NAT for AdvertiseRoutes. Nil
+	// means the platform implementation; tests replace it, because pfctl is
+	// not something a test run should touch on the developer's machine.
+	EnableNetshare func(ctx context.Context, cfg netshare.Config) (func(), error)
+
+	// SyncRoutes installs and removes the routes other Nodes' LANs need. Nil
+	// means the platform implementation (netcfg + route(8)); tests replace it
+	// with a recorder, because a test run must not edit the host's table.
+	SyncRoutes func(ctx context.Context, iface string, add, remove []netip.Prefix) error
+
+	// Runner runs the route commands SyncRoutes issues. Nil means
+	// netcfg.ExecRunner{}; tests set it to a recorder that captures the
+	// commands without touching the host's routing table.
+	Runner netcfg.Runner
 
 	// DNSListen overrides the address MagicDNS binds. Empty means the Node's
 	// own Overlay IPv4: that is the point of listening there — a query for
@@ -147,6 +170,175 @@ func (d *Daemon) startMagicDNS(ctx context.Context, zone string, self netip.Addr
 	}
 }
 
+// permanentError marks a failure that retrying cannot fix: a rejected
+// advertisement, a missing LAN, a flag that will parse the same way every two
+// seconds. The Supervisor uses it to stay down until the user reconnects.
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
+// permanent wraps err without changing its message, so operators still see the
+// Control Plane's own explanation.
+func permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &permanentError{err: err}
+}
+
+func isPermanent(err error) bool {
+	var p *permanentError
+	return errors.As(err, &p)
+}
+
+// rejectedStatus says whether the Control Plane's answer will still be wrong
+// after a retry. 408 and 429 are explicitly retryable: the request was not
+// understood to be invalid, the server was busy or the client timed out.
+func rejectedStatus(code int) bool {
+	switch code {
+	case 400, 401, 403, 404, 405, 409, 422:
+		return true
+	}
+	return false
+}
+
+// normalizeRoutes turns --advertise-routes into the one shape the rest of the
+// daemon uses: masked, deduped, sorted, and held to the same limits the
+// Control Plane enforces. It runs before any privileged step, so a bad flag
+// fails before a TUN or a pf anchor exists to clean up.
+func normalizeRoutes(in []netip.Prefix) ([]netip.Prefix, error) {
+	return subnet.Normalize(in)
+}
+
+// advertiseRoutes publishes the advertisement, empty included: an Agent that
+// restarts without --advertise-routes must withdraw the claim it made last
+// time, or peers keep sending LAN traffic to a Gateway that no longer serves
+// it. It fails loudly: a Gateway whose advertisement was rejected must not sit
+// there looking healthy while peers see nothing.
+func (d *Daemon) advertiseRoutes(ctx context.Context, ctrl *Control, routes []netip.Prefix, log *slog.Logger) error {
+	if err := ctrl.SetRoutes(ctx, routeStrings(routes)); err != nil {
+		var status *ctlapi.StatusError
+		if errors.As(err, &status) {
+			// An older Control Plane has no /v1/routes. An Agent with nothing
+			// to advertise has nothing to withdraw either, so this is not a
+			// reason to stop a working tunnel; a Gateway that does have a
+			// claim to make still fails loudly below.
+			if status.Status == 404 && len(routes) == 0 {
+				log.Warn("control plane has no subnet-route endpoint; nothing to withdraw")
+				return nil
+			}
+			if rejectedStatus(status.Status) {
+				// A rejected claim must not leave the old one standing: peers would
+				// keep routing the old LANs here even though this Agent is dying.
+				// Only a rejection is permanent though — a 5xx, 408 or 429 is
+				// transient, and withdrawing would drop a claim that is still valid.
+				d.withdrawRoutes(ctrl, log)
+				return permanent(fmt.Errorf("advertise routes: %w", err))
+			}
+		}
+		return fmt.Errorf("advertise routes: %w", err)
+	}
+	if len(routes) > 0 {
+		log.Info("advertised subnet routes", "routes", routeStrings(routes))
+	}
+	return nil
+}
+
+// withdrawRoutes releases this Node's claim on the way out. It gets its own
+// timeout instead of the session's context: shutdown must not hang on a
+// Control Plane that is already going away.
+func (d *Daemon) withdrawRoutes(ctrl *Control, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := ctrl.SetRoutes(ctx, nil); err != nil {
+		log.Warn("withdraw subnet routes", "err", err)
+	}
+}
+
+// syncRoutes applies a route delta with the production runner unless a test
+// replaced it.
+func (d *Daemon) syncRoutes(ctx context.Context, iface string, add, remove []netip.Prefix) error {
+	if d.SyncRoutes != nil {
+		return d.SyncRoutes(ctx, iface, add, remove)
+	}
+	r := d.Runner
+	if r == nil {
+		r = netcfg.ExecRunner{}
+	}
+	var errs []error
+	for _, pr := range add {
+		if err := netcfg.AddRoute(ctx, r, iface, pr); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, pr := range remove {
+		if err := netcfg.DeleteRoute(ctx, r, iface, pr); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// reconcileRoutes installs the difference between what is on the TUN and what
+// the map now wants, returning the installed set. On failure the old set is
+// returned so the next poll retries the same delta; a route that could not be
+// installed must not be forgotten, or it would never be retried.
+func (d *Daemon) reconcileRoutes(ctx context.Context, iface string, installed, desired []netip.Prefix, log *slog.Logger) []netip.Prefix {
+	add, remove := routeDelta(installed, desired)
+	if len(add) == 0 && len(remove) == 0 {
+		return installed
+	}
+	if err := d.syncRoutes(ctx, iface, add, remove); err != nil {
+		log.Warn("sync peer routes", "add", routeStrings(add), "remove", routeStrings(remove), "err", err)
+		return installed
+	}
+	return desired
+}
+
+// routeDelta is the set difference between what is installed and what the map
+// wants. Pure, so the interesting cases — a Gateway appearing, a Gateway
+// leaving, a failed install being retried — need no network to test.
+func routeDelta(installed, desired []netip.Prefix) (add, remove []netip.Prefix) {
+	have := make(map[netip.Prefix]bool, len(installed))
+	for _, pr := range installed {
+		have[pr.Masked()] = true
+	}
+	want := make(map[netip.Prefix]bool, len(desired))
+	for _, pr := range desired {
+		pr = pr.Masked()
+		want[pr] = true
+		if !have[pr] {
+			add = append(add, pr)
+		}
+	}
+	for _, pr := range installed {
+		pr = pr.Masked()
+		if !want[pr] {
+			remove = append(remove, pr)
+		}
+	}
+	sortPrefixes(add)
+	sortPrefixes(remove)
+	return add, remove
+}
+
+// sortPrefixes gives routes one stable order, so logs and deltas do not
+// shuffle between two polls of the same map.
+func sortPrefixes(ps []netip.Prefix) {
+	sort.Slice(ps, func(i, j int) bool { return ps[i].String() < ps[j].String() })
+}
+
+// routeStrings is the wire form: canonical, sorted, one prefix per entry.
+func routeStrings(routes []netip.Prefix) []string {
+	out := make([]string, 0, len(routes))
+	for _, pr := range routes {
+		out = append(out, pr.Masked().String())
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (d *Daemon) logger() *slog.Logger {
 	if d.Logger != nil {
 		return d.Logger
@@ -201,6 +393,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	ctrl := d.State.Control()
+
+	// Validate and canonicalize before anything privileged exists.
+	advertised, err := normalizeRoutes(d.AdvertiseRoutes)
+	if err != nil {
+		// The same flags produce the same error until someone edits them.
+		return permanent(err)
+	}
 
 	// The first map decides the Relay, so it cannot be a long poll: hang here
 	// and fail loudly instead of starting a tunnel that goes nowhere.
@@ -305,17 +504,55 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	routes := subnetRoutes(pm)
+	peerRoutes := subnetRoutes(pm)
 	if err := d.configure(ctx, netcfg.Config{
 		Name:    iface,
 		IPv4:    self.IPv4,
-		IPv4Net: overlayV4Net,
+		IPv4Net: subnet.OverlayV4,
 		IPv6:    self.IPv6,
-		IPv6Net: overlayV6Net,
+		IPv6Net: subnet.OverlayV6,
 		MTU:     MTU,
-		Routes:  routes,
+		Routes:  peerRoutes,
 	}); err != nil {
 		return err
+	}
+
+	// The LAN has to work before the Control Plane tells peers to use it: a
+	// claim for a Gateway that cannot forward black-holes every peer's traffic
+	// to that LAN. Netshare therefore comes before the advertisement, never
+	// the other way round.
+	if len(advertised) > 0 {
+		enable := d.EnableNetshare
+		if enable == nil {
+			enable = func(ctx context.Context, cfg netshare.Config) (func(), error) {
+				return netshare.Enable(ctx, netcfg.ExecRunner{}, cfg)
+			}
+		}
+		stopShare, err := enable(ctx, netshare.Config{
+			TUN:       iface,
+			Routes:    advertised,
+			TokenPath: netshare.DefaultTokenPath,
+		})
+		if err != nil {
+			// Do not leave a stale claim behind if this machine used to be a
+			// Gateway for these LANs.
+			d.withdrawRoutes(ctrl, log)
+			// Privileged setup failed for a reason (no route to the LAN, pf
+			// refused the anchor), and re-running it every two seconds only
+			// re-runs the same failure.
+			return permanent(fmt.Errorf("subnet router: %w", err))
+		}
+		defer stopShare()
+		log.Info("subnet router enabled", "routes", routeStrings(advertised), "tun", iface)
+	}
+
+	if err := d.advertiseRoutes(ctx, ctrl, advertised, log); err != nil {
+		return err
+	}
+	if len(advertised) > 0 {
+		// A deliberate stop is the normal end of a session: tell the Control
+		// Plane, so a restart without the flag cannot keep a dead claim alive.
+		defer d.withdrawRoutes(ctrl, log)
 	}
 
 	ownsTUN = false // New takes the device over, including closing it on error
@@ -338,15 +575,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	stopDNS := d.startMagicDNS(runCtx, pm.Network.Domain, self.IPv4, state0(live), log)
 	defer stopDNS()
 	state := &runtimeState{home: d.home(), rt: Runtime{
-		PID:       os.Getpid(),
-		StartedAt: time.Now().UTC(),
-		Hostname:  d.State.Hostname,
-		IPv4:      self.IPv4.String(),
-		IPv6:      self.IPv6.String(),
-		Network:   pm.Network.Name,
-		RelayUDP:  relayAddr.String(),
-		RelayMode: string(lnk.Mode()),
-		Peers:     runtimePeers(pm, mgr),
+		PID:             os.Getpid(),
+		StartedAt:       time.Now().UTC(),
+		Hostname:        d.State.Hostname,
+		IPv4:            self.IPv4.String(),
+		IPv6:            self.IPv6.String(),
+		Network:         pm.Network.Name,
+		RelayUDP:        relayAddr.String(),
+		RelayMode:       string(lnk.Mode()),
+		AdvertiseRoutes: routeStrings(advertised),
+		Peers:           runtimePeers(pm, mgr),
 	}}
 	// A path change is worth a status refresh right away: punching is fast,
 	// and a stale "Relayed" reads like a broken tunnel.
@@ -374,7 +612,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}()
 	go func() {
 		defer wg.Done()
-		d.mapLoop(runCtx, ctrl, dev, mgr, live, state, pm.Version)
+		d.mapLoop(runCtx, ctrl, dev, mgr, live, state, pm.Version, iface, peerRoutes)
 	}()
 	go func() {
 		defer wg.Done()
@@ -419,8 +657,6 @@ func (d *Daemon) heartbeatLoop(ctx context.Context, ctrl *Control, client *relay
 	}
 }
 
-// mapLoop follows the Peer Map for as long as the tunnel runs. Control Plane
-// outages must not drop the tunnel, so errors back off instead of returning.
 // candidateLoop publishes where this Agent can be reached. The lan address is
 // free; the STUN answer costs one round trip to the Relay and is what makes a
 // punch work across two networks instead of only inside one.
@@ -452,9 +688,25 @@ func (d *Daemon) candidateLoop(ctx context.Context, ctrl *Control, pc net.Packet
 	}
 }
 
-func (d *Daemon) mapLoop(ctx context.Context, ctrl *Control, dev *tunnel.Device, mgr *punch.Manager, live *livePeers, st *runtimeState, version int64) {
+// waitForRetry sleeps for d, reporting false when the context ended first.
+// Callers return on false so a shutdown does not have to wait out the backoff.
+func waitForRetry(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// mapLoop follows the Peer Map for as long as the tunnel runs. Control Plane
+// outages must not drop the tunnel, so errors back off instead of returning.
+// Route changes are reconciled here too: a Gateway may appear or leave long
+// after the TUN was configured.
+func (d *Daemon) mapLoop(ctx context.Context, ctrl *Control, dev *tunnel.Device, mgr *punch.Manager, live *livePeers, st *runtimeState, version int64, iface string, installed []netip.Prefix) {
 	log := d.logger()
 	backoff := time.Second
+	desired := installed
 	for ctx.Err() == nil {
 		pm, err := ctrl.Map(ctx, version)
 		if err != nil {
@@ -462,30 +714,59 @@ func (d *Daemon) mapLoop(ctx context.Context, ctrl *Control, dev *tunnel.Device,
 				return
 			}
 			log.Warn("map", "err", err, "retry_in", backoff)
-			select {
-			case <-ctx.Done():
+			if !waitForRetry(ctx, backoff) {
 				return
-			case <-time.After(backoff):
 			}
 			if backoff < 30*time.Second {
 				backoff *= 2
 			}
 			continue
 		}
-		backoff = time.Second
 		if pm == nil {
+			// Nothing new, but a route install may have failed last time: the
+			// retry must not wait for a map change that may never come.
+			installed = d.reconcileRoutes(ctx, iface, installed, desired, log)
 			continue
 		}
-		version = pm.Version
+		desired = subnetRoutes(pm)
+		// Peers first, routes second. Installing a kernel route before the
+		// peer's allowed IPs exist black-holes that LAN: the packet leaves
+		// through the TUN and WireGuard has nowhere to send it.
 		peers, err := peersFromMap(pm)
 		if err != nil {
-			log.Warn("map: bad peer", "err", err)
+			log.Warn("map: bad peer", "err", err, "retry_in", backoff)
+			if !waitForRetry(ctx, backoff) {
+				return
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 			continue
 		}
 		if err := dev.Apply(peers); err != nil {
-			log.Warn("apply peers", "err", err)
+			log.Warn("apply peers", "err", err, "retry_in", backoff)
+			if !waitForRetry(ctx, backoff) {
+				return
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 			continue
 		}
+		// Only a successful Apply may advance the version. Otherwise the next
+		// long poll asks for the same map and can retry the peers it missed;
+		// advancing first would make the Control Plane answer 204 forever.
+		//
+		// That is why the failure branches above pause before retrying: with
+		// version unchanged the Control Plane answers the same map at once
+		// when `since < currentVersion`, so a persistent bad map (invalid
+		// pubkey, bad subnet_routes) or a persistent Apply failure would spin
+		// at full speed. The pause keeps the retry loop from becoming a hot
+		// loop, and the backoff resets only here, once the map is really
+		// installed.
+		backoff = time.Second
+		version = pm.Version
+		installed = d.reconcileRoutes(ctx, iface, installed, desired, log)
 		live.set(pm)
 		if set, err := punchPeers(pm); err == nil && !d.NoPunch {
 			mgr.SetPeers(set)
@@ -556,11 +837,6 @@ func sameRuntimePeers(a, b []RuntimePeer) bool {
 	return true
 }
 
-var (
-	overlayV4Net = netip.MustParsePrefix("100.64.0.0/10")
-	overlayV6Net = netip.MustParsePrefix("fd00::/64")
-)
-
 func pickRelay(pm *proto.PeerMap) (netip.AddrPort, []byte, error) {
 	for _, r := range pm.Relays {
 		if r.UDP == "" {
@@ -624,17 +900,28 @@ func peersFromMap(pm *proto.PeerMap) ([]tunnel.Peer, error) {
 	return out, nil
 }
 
-// subnetRoutes is every LAN a peer routes for. Without a route the packets
-// would leave through the default gateway instead of the tunnel.
+// subnetRoutes is every LAN a peer routes for: masked, deduped, sorted, so it
+// can be compared against what is installed without spurious deltas. Without a
+// route the packets would leave through the default gateway instead of the
+// tunnel.
 func subnetRoutes(pm *proto.PeerMap) []netip.Prefix {
 	var out []netip.Prefix
+	seen := make(map[netip.Prefix]bool)
 	for _, p := range pm.Peers {
 		for _, raw := range p.SubnetRoutes {
-			if pr, err := netip.ParsePrefix(raw); err == nil {
-				out = append(out, pr)
+			pr, err := netip.ParsePrefix(raw)
+			if err != nil {
+				continue
 			}
+			pr = pr.Masked()
+			if seen[pr] {
+				continue
+			}
+			seen[pr] = true
+			out = append(out, pr)
 		}
 	}
+	sortPrefixes(out)
 	return out
 }
 

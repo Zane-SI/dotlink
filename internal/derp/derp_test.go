@@ -10,18 +10,18 @@ import (
 	"time"
 )
 
-func startServer(t *testing.T) (addr string, clientTLS *tls.Config) {
+func startServer(t *testing.T) (addr string, clientTLS *tls.Config, srv *Server) {
 	t.Helper()
 	serverTLS, clientTLS := testTLS(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv := NewServer([32]byte{1, 2, 3}, slog.New(slog.DiscardHandler))
+	srv = NewServer([32]byte{1, 2, 3}, slog.New(slog.DiscardHandler))
 	srv.PingInterval = 50 * time.Millisecond
 	go func() { _ = srv.ServeTLS(ln, serverTLS) }()
 	t.Cleanup(func() { _ = srv.Close() })
-	return ln.Addr().String(), clientTLS
+	return ln.Addr().String(), clientTLS, srv
 }
 
 func dial(t *testing.T, addr string, tlsCfg *tls.Config, key byte) *Client {
@@ -43,6 +43,21 @@ func dial(t *testing.T, addr string, tlsCfg *tls.Config, key byte) *Client {
 	return c
 }
 
+// waitServerClients waits until the server has processed the ClientInfo
+// frames. Client.Registered only proves the handshake was written, so a test
+// that sends immediately after Dial can race the server's registration.
+func waitServerClients(t *testing.T, srv *Server, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.Registered() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("server registered %d clients, want %d", srv.Registered(), want)
+}
+
 func waitRegistered(t *testing.T, c *Client) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -56,7 +71,7 @@ func waitRegistered(t *testing.T, c *Client) {
 }
 
 func TestPingPongMarksTheClientRegistered(t *testing.T) {
-	addr, tlsCfg := startServer(t)
+	addr, tlsCfg, _ := startServer(t)
 	c := dial(t, addr, tlsCfg, 7)
 	// A finished handshake counts as reachable; the ping confirms it and
 	// keeps it true.
@@ -67,10 +82,11 @@ func TestPingPongMarksTheClientRegistered(t *testing.T) {
 }
 
 func TestPacketsTravelBetweenKeys(t *testing.T) {
-	addr, tlsCfg := startServer(t)
+	addr, tlsCfg, srv := startServer(t)
 	a, b := dial(t, addr, tlsCfg, 1), dial(t, addr, tlsCfg, 2)
 	waitRegistered(t, a)
 	waitRegistered(t, b)
+	waitServerClients(t, srv, 2)
 
 	want := [32]byte{1}
 	if err := a.SendTo([32]byte{2}, []byte("hello beacon")); err != nil {
@@ -90,9 +106,10 @@ func TestPacketsTravelBetweenKeys(t *testing.T) {
 }
 
 func TestPacketForAnAbsentPeerIsDropped(t *testing.T) {
-	addr, tlsCfg := startServer(t)
+	addr, tlsCfg, srv := startServer(t)
 	a := dial(t, addr, tlsCfg, 1)
 	waitRegistered(t, a)
+	waitServerClients(t, srv, 1)
 	if err := a.SendTo([32]byte{99}, []byte("nobody home")); err != nil {
 		t.Fatalf("send to an absent peer returned %v, want nil", err)
 	}
@@ -104,14 +121,16 @@ func TestPacketForAnAbsentPeerIsDropped(t *testing.T) {
 }
 
 func TestReconnectingWithTheSameKeyReplacesTheOldConnection(t *testing.T) {
-	addr, tlsCfg := startServer(t)
+	addr, tlsCfg, srv := startServer(t)
 	older := dial(t, addr, tlsCfg, 5)
 	waitRegistered(t, older)
 	newer := dial(t, addr, tlsCfg, 5)
 	waitRegistered(t, newer)
+	waitServerClients(t, srv, 1) // newer replaces older under the same key
 
 	sender := dial(t, addr, tlsCfg, 6)
 	waitRegistered(t, sender)
+	waitServerClients(t, srv, 2)
 	if err := sender.SendTo([32]byte{5}, []byte("for the newest")); err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -129,7 +148,7 @@ func TestReconnectingWithTheSameKeyReplacesTheOldConnection(t *testing.T) {
 }
 
 func TestPlainHTTPIsRejected(t *testing.T) {
-	addr, _ := startServer(t)
+	addr, _, _ := startServer(t)
 	resp, err := http.Get("http://" + addr + Path)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -146,10 +165,11 @@ func TestPlainHTTPIsRejected(t *testing.T) {
 // link, so this catches structural mistakes (a frame copied per hop, a
 // synchronous write per packet), not network luck.
 func TestDERPForwardsAtLineRate(t *testing.T) {
-	addr, tlsCfg := startServer(t)
+	addr, tlsCfg, srv := startServer(t)
 	a, b := dial(t, addr, tlsCfg, 1), dial(t, addr, tlsCfg, 2)
 	waitRegistered(t, a)
 	waitRegistered(t, b)
+	waitServerClients(t, srv, 2)
 
 	const (
 		chunk = 16 << 10

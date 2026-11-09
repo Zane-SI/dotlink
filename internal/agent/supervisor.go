@@ -106,6 +106,9 @@ func (s *Supervisor) Serve(ctx context.Context) {
 	if err := s.Start(ctx); err != nil {
 		log.Error("start tunnel", "err", err)
 	}
+	// A failed session is retried silently otherwise, which turns a 409 on the
+	// route advertisement (or a missing LAN) into an invisible restart loop.
+	var loggedErr error
 	for {
 		select {
 		case <-ctx.Done():
@@ -131,8 +134,26 @@ func (s *Supervisor) Serve(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-time.After(delay):
-			if s.Err() == nil {
-				// Stopped on purpose; stay idle until Connect.
+			err := s.Err()
+			if err == nil {
+				// Stopped on purpose; stay idle until Connect. The next
+				// failure is a new event, even if it has the same text as one
+				// logged before this clean run.
+				loggedErr = nil
+				continue
+			}
+			if loggedErr == nil || err.Error() != loggedErr.Error() {
+				if isPermanent(err) {
+					log.Error("tunnel session failed; not retrying until reconnect", "err", err)
+				} else {
+					log.Error("tunnel session failed", "err", err)
+				}
+				loggedErr = err
+			}
+			if isPermanent(err) {
+				// Retrying a rejected advertisement or a missing LAN only hides
+				// the problem behind a restart loop. Stay down until the user
+				// fixes it and reconnects; Start still works then.
 				continue
 			}
 			if err := s.Start(ctx); err != nil {

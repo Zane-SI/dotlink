@@ -7,10 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/signal"
 	"os/user"
 	"runtime"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -22,6 +24,33 @@ import (
 
 // version is stamped at build time with -ldflags -X main.version=…
 var version = "dev"
+
+// routesFlag accepts --advertise-routes a,b and --advertise-routes a
+// --advertise-routes b, because both spellings are what people type.
+type routesFlag []netip.Prefix
+
+func (r *routesFlag) String() string {
+	out := make([]string, 0, len(*r))
+	for _, pr := range *r {
+		out = append(out, pr.String())
+	}
+	return strings.Join(out, ",")
+}
+
+func (r *routesFlag) Set(v string) error {
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		pr, err := netip.ParsePrefix(part)
+		if err != nil {
+			return fmt.Errorf("%q is not a CIDR prefix", part)
+		}
+		*r = append(*r, pr.Masked())
+	}
+	return nil
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -153,17 +182,56 @@ func runNodes(args []string) error {
 	}
 }
 
-func runUp(args []string) error {
-	fs := flag.NewFlagSet("up", flag.ExitOnError)
+type upOptions struct {
+	listen     string
+	derpAddr   string
+	socket     string
+	adminToken string
+	relayOnly  bool
+	routes     []netip.Prefix
+}
+
+// parseUpFlags keeps the flags in one place so a test can prove
+// --advertise-routes reaches the Daemon instead of only testing the flag type.
+func parseUpFlags(args []string) (upOptions, error) {
+	fs := flag.NewFlagSet("up", flag.ContinueOnError)
 	listen := fs.String("listen", agent.DefaultUDPListen, "UDP listen address; the same socket carries Relay traffic and hole punching")
 	derpAddr := fs.String("derp", "", "DERP endpoint to use instead of the one in the Peer Map")
 	relayOnly := fs.Bool("relay-only", false, "skip hole punching and stay on the Relay")
 	socket := fs.String("socket", ipc.DefaultSocket, "Unix socket the menu bar app talks to")
 	adminToken := fs.String("admin-token", "", "Control Plane admin token; needed only to sign invites (env DOTLINK_ADMIN_TOKEN)")
+	var routes routesFlag
+	fs.Var(&routes, "advertise-routes", "LAN prefixes to forward for, comma separated (e.g. 192.168.1.0/24)")
 	if err := fs.Parse(args); err != nil {
+		return upOptions{}, err
+	}
+	return upOptions{
+		listen:     *listen,
+		derpAddr:   *derpAddr,
+		socket:     *socket,
+		adminToken: *adminToken,
+		relayOnly:  *relayOnly,
+		routes:     routes,
+	}, nil
+}
+
+func upDaemon(opts upOptions, st agent.State, log *slog.Logger) *agent.Daemon {
+	return &agent.Daemon{
+		State:           st,
+		UDPListen:       opts.listen,
+		DERPAddr:        opts.derpAddr,
+		NoPunch:         opts.relayOnly,
+		AdvertiseRoutes: opts.routes,
+		Logger:          log,
+	}
+}
+
+func runUp(args []string) error {
+	opts, err := parseUpFlags(args)
+	if err != nil {
 		return err
 	}
-	token := *adminToken
+	token := opts.adminToken
 	if token == "" {
 		token = os.Getenv("DOTLINK_ADMIN_TOKEN")
 	}
@@ -179,7 +247,7 @@ func runUp(args []string) error {
 	defer stop()
 
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
-	d := &agent.Daemon{State: st, UDPListen: *listen, DERPAddr: *derpAddr, NoPunch: *relayOnly, Logger: log}
+	d := upDaemon(opts, st, log)
 
 	// The supervisor owns the tunnel; the socket owns the supervisor. A menu
 	// bar disconnect must not kill the process, or KeepAlive would bring the
@@ -188,7 +256,7 @@ func runUp(args []string) error {
 	go sup.Serve(ctx)
 
 	local := &agent.LocalControl{Supervisor: sup, State: st, AdminToken: token, Logger: log}
-	srv := &ipc.Server{Path: *socket, Provider: local, Logger: log}
+	srv := &ipc.Server{Path: opts.socket, Provider: local, Logger: log}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe(ctx) }()
 
@@ -265,14 +333,18 @@ func printNodes(pm *proto.PeerMap) {
 		return
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "HOSTNAME\tIPV4\tIPV6\tONLINE\tLAST SEEN")
+	fmt.Fprintln(w, "HOSTNAME\tIPV4\tIPV6\tONLINE\tLAST SEEN\tROUTES")
 	for _, p := range pm.Peers {
 		online := "no"
 		if p.Online {
 			online = "yes"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			p.Hostname, p.IPv4, p.IPv6, online, p.LastSeen.Local().Format(time.RFC3339))
+		routes := "-"
+		if len(p.SubnetRoutes) > 0 {
+			routes = strings.Join(p.SubnetRoutes, ",")
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			p.Hostname, p.IPv4, p.IPv6, online, p.LastSeen.Local().Format(time.RFC3339), routes)
 	}
 	w.Flush()
 }
@@ -299,6 +371,11 @@ func printLiveStatus(st ipc.Status) {
 	}
 	fmt.Printf("agent:   %s (pid %d, relay %s)\n", state, st.PID, relay)
 	fmt.Printf("overlay: %s / %s\n", st.IPv4, st.IPv6)
+	routes := "none"
+	if len(st.AdvertiseRoutes) > 0 {
+		routes = strings.Join(st.AdvertiseRoutes, ", ")
+	}
+	fmt.Printf("routes:  %s\n", routes)
 	if st.Error != "" {
 		fmt.Printf("error:   %s\n", st.Error)
 	}

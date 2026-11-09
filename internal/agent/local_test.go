@@ -61,7 +61,8 @@ func TestStatusPrefersTheLiveSnapshot(t *testing.T) {
 	}
 	defer sup.Stop()
 	rt := Runtime{PID: 4242, StartedAt: time.Now(), RelayUDP: "relay:3478", RelayMode: "derp",
-		Registered: true, Peers: []RuntimePeer{{Hostname: "macbook", IPv4: "100.64.0.2", Path: "Direct", RTTms: 9}}}
+		AdvertiseRoutes: []string{"192.168.1.0/24"},
+		Registered:      true, Peers: []RuntimePeer{{Hostname: "macbook", IPv4: "100.64.0.2", Path: "Direct", RTTms: 9}}}
 	if err := SaveRuntimeIn(home, rt); err != nil {
 		t.Fatalf("save runtime: %v", err)
 	}
@@ -74,6 +75,9 @@ func TestStatusPrefersTheLiveSnapshot(t *testing.T) {
 	}
 	if len(st.Peers) != 1 || st.Peers[0].Path != "Direct" || st.Peers[0].RTTms != 9 {
 		t.Fatalf("peers = %+v", st.Peers)
+	}
+	if len(st.AdvertiseRoutes) != 1 || st.AdvertiseRoutes[0] != "192.168.1.0/24" {
+		t.Fatalf("advertise routes = %v", st.AdvertiseRoutes)
 	}
 	if !st.CanInvite {
 		t.Fatal("an admin token did not unlock invites")
