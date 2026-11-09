@@ -31,16 +31,23 @@ type Candidate struct {
 // Self is the asking Node's own view of itself in the Peer Map.
 type Self struct {
 	NodeID   string `json:"node_id"`
-	IPv4     string `json:"ipv4"`
-	IPv6     string `json:"ipv6"`
 	Hostname string `json:"hostname"`
+	// DNSName is the label the Node answers to under the Network's domain,
+	// derived by the Control Plane so both ends agree without a round trip.
+	DNSName string `json:"dns_name,omitempty"`
+	IPv4    string `json:"ipv4"`
+	IPv6    string `json:"ipv6"`
 }
 
 // Node is another Node in the same Network. The map's JSON key for these
 // is "peers" (docs/spec/v1.md §3.2); everywhere else the term is Node.
 type Node struct {
-	NodeID       string      `json:"node_id"`
-	Hostname     string      `json:"hostname"`
+	NodeID   string `json:"node_id"`
+	Hostname string `json:"hostname"`
+	// DNSName is the label this Node answers to under the Network's domain:
+	// "mac-mini" for mac-mini.dotlink. The Control Plane derives it and
+	// refuses a second Node that would claim the same one.
+	DNSName      string      `json:"dns_name,omitempty"`
 	Pubkey       string      `json:"pubkey"`
 	IPv4         string      `json:"ipv4"`
 	IPv6         string      `json:"ipv6"`

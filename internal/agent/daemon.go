@@ -18,6 +18,7 @@ import (
 
 	"github.com/Zane-SI/dotlink/internal/derp"
 	"github.com/Zane-SI/dotlink/internal/link"
+	"github.com/Zane-SI/dotlink/internal/magicdns"
 	"github.com/Zane-SI/dotlink/internal/netcfg"
 	"github.com/Zane-SI/dotlink/internal/proto"
 	"github.com/Zane-SI/dotlink/internal/punch"
@@ -68,6 +69,16 @@ type Daemon struct {
 	// than watching five rounds fail every minute.
 	NoPunch bool
 
+	// DNSListen overrides the address MagicDNS binds. Empty means the Node's
+	// own Overlay IPv4: that is the point of listening there — a query for
+	// mac-mini.dotlink never leaves the machine that asked.
+	DNSListen string
+	// DNSPort overrides :53, which only root can bind.
+	DNSPort int
+	// ConfigureResolver installs the OS's split-DNS rule. Nil means the
+	// platform default (netcfg.WriteResolver).
+	ConfigureResolver func(zone string, addr netip.Addr) (func(), error)
+
 	// MakeTUN and Configure are the only privileged steps. Tests replace them.
 	MakeTUN   func(mtu int) (tun.Device, error)
 	Configure func(ctx context.Context, cfg netcfg.Config) error
@@ -79,6 +90,61 @@ func (d *Daemon) home() string {
 		return d.Home
 	}
 	return mustHome()
+}
+
+// state0 adapts livePeers to the lookup magicdns wants.
+func state0(live *livePeers) func() map[string]magicdns.Record {
+	return func() map[string]magicdns.Record {
+		pm := live.get()
+		if pm == nil {
+			return nil
+		}
+		out := make(map[string]magicdns.Record, len(pm.Peers)+1)
+		if self, err := parseSelf(pm); err == nil {
+			out[magicdns.Label(pm.Self.Hostname)] = magicdns.Record{IPv4: self.IPv4, IPv6: self.IPv6}
+		}
+		for _, p := range pm.Peers {
+			v4, _ := netip.ParseAddr(p.IPv4)
+			v6, _ := netip.ParseAddr(p.IPv6)
+			name := p.DNSName
+			if name == "" {
+				name = magicdns.Label(p.Hostname)
+			}
+			out[name] = magicdns.Record{IPv4: v4, IPv6: v6}
+		}
+		return out
+	}
+}
+
+// startMagicDNS serves the zone and installs the OS rule, returning a cleanup
+// that removes the rule before the address it points at goes away.
+func (d *Daemon) startMagicDNS(ctx context.Context, zone string, self netip.Addr, lookup func() map[string]magicdns.Record, log *slog.Logger) func() {
+	if zone == "" || !self.IsValid() {
+		return func() {}
+	}
+	dns := &magicdns.Server{Zone: zone, Addr: self, Local: d.DNSListen, Port: d.DNSPort, Lookup: lookup, Log: log}
+	go func() {
+		if err := dns.ListenAndServe(ctx); err != nil {
+			log.Warn("magicdns stopped", "err", err)
+		}
+	}()
+
+	configure := d.ConfigureResolver
+	if configure == nil {
+		configure = netcfg.WriteResolver
+	}
+	remove, err := configure(zone, self)
+	if err != nil {
+		// The tunnel works without names; failing the session over DNS would
+		// take the network down to protect a convenience.
+		log.Warn("magicdns: could not install the resolver rule", "zone", zone, "err", err)
+		return func() { _ = dns.Close() }
+	}
+	log.Info("magicdns installed", "zone", zone, "addr", self.String())
+	return func() {
+		remove()
+		_ = dns.Close()
+	}
 }
 
 func (d *Daemon) logger() *slog.Logger {
@@ -265,6 +331,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	live := &livePeers{}
 	live.set(pm)
+
+	// MagicDNS. The listener is on our own Overlay address, which the kernel
+	// treats as local: queries are delivered without ever reaching the TUN,
+	// so they cannot leak to a peer or to the system resolver.
+	stopDNS := d.startMagicDNS(runCtx, pm.Network.Domain, self.IPv4, state0(live), log)
+	defer stopDNS()
 	state := &runtimeState{home: d.home(), rt: Runtime{
 		PID:       os.Getpid(),
 		StartedAt: time.Now().UTC(),

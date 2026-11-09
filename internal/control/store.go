@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Zane-SI/dotlink/internal/magicdns"
 	"github.com/Zane-SI/dotlink/internal/proto"
 	_ "modernc.org/sqlite"
 )
@@ -62,6 +63,30 @@ var (
 const inviteTTL = 24 * time.Hour
 
 var tokenEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+// errHostnameTaken means another live Node already answers to this name.
+var errHostnameTaken = errors.New("hostname already in use")
+
+// checkNameFree refuses a hostname whose DNS label another live Node holds.
+// Revoked Nodes are skipped: their name goes back into the pool.
+func checkNameFree(tx *sql.Tx, hostname string) error {
+	want := magicdns.Label(hostname)
+	rows, err := tx.Query(`SELECT hostname FROM nodes WHERE revoked = 0`)
+	if err != nil {
+		return fmt.Errorf("check hostname: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var taken string
+		if err := rows.Scan(&taken); err != nil {
+			return err
+		}
+		if magicdns.Label(taken) == want {
+			return fmt.Errorf("%w: %q is already another Node's name", errHostnameTaken, want)
+		}
+	}
+	return rows.Err()
+}
 
 // newToken returns prefix followed by nbytes of randomness in lowercase base32.
 func newToken(prefix string, nbytes int) (string, error) {
@@ -222,6 +247,13 @@ func (s *Server) enroll(req proto.EnrollRequest, now time.Time) (nodeRow, error)
 	}
 	if now.After(time.Unix(expiresAt, 0)) {
 		return nodeRow{}, errInviteExpired
+	}
+
+	// Two Nodes answering to the same name would make the name useless, so
+	// the second enrollment is refused instead of silently suffixed: the user
+	// needs to know which machine they are typing at.
+	if err := checkNameFree(tx, req.Hostname); err != nil {
+		return nodeRow{}, err
 	}
 
 	nodeID, err := newToken("n_", 5)

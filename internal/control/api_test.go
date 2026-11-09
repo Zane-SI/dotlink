@@ -648,3 +648,55 @@ func peerByID(pm proto.PeerMap, id string) proto.Node {
 	}
 	return proto.Node{}
 }
+
+func TestEnrollmentRefusesADuplicateHostname(t *testing.T) {
+	e := newTestEnv(t)
+	first := e.joinNode(t, "mac-mini")
+
+	// "Mac-Mini.local" is the same name on the wire as "mac-mini": the label
+	// is lowercased and cut at the first dot. Suffixing silently would leave
+	// the user typing at the wrong machine.
+	inv := e.newInvite(t)
+	var body struct {
+		Error string `json:"error"`
+	}
+	resp := e.call(t, http.MethodPost, "/v1/enroll", "", proto.EnrollRequest{
+		Invite: inv.Token, Pubkey: "pk-dup", Hostname: "Mac-Mini.local", OS: "darwin",
+	}, &body)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", resp.StatusCode)
+	}
+	if !strings.Contains(body.Error, "mac-mini") {
+		t.Fatalf("message %q does not name the clash", body.Error)
+	}
+
+	// A different name is fine.
+	e.joinNode(t, "macbook")
+
+	// Revoking the holder frees the name: a reinstalled machine should not
+	// need a new hostname for ever.
+	if resp := e.call(t, http.MethodDelete, "/v1/admin/nodes/"+first.NodeID, testAdminToken, nil, nil); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke: status = %d", resp.StatusCode)
+	}
+	e.joinNode(t, "mac-mini")
+}
+
+func TestMapCarriesTheDNSLabel(t *testing.T) {
+	e := newTestEnv(t)
+	e.joinNode(t, "mac-mini")
+	book := e.joinNode(t, "MacBook.local")
+
+	var pm proto.PeerMap
+	if resp := e.call(t, http.MethodGet, "/v1/map?since=0", book.NodeToken, nil, &pm); resp.StatusCode != http.StatusOK {
+		t.Fatalf("map: status = %d", resp.StatusCode)
+	}
+	if len(pm.Peers) != 1 {
+		t.Fatalf("peers = %d", len(pm.Peers))
+	}
+	if got := pm.Peers[0].DNSName; got != "mac-mini" {
+		t.Fatalf("dns_name = %q, want mac-mini", got)
+	}
+	if got := pm.Self.DNSName; got != "macbook" {
+		t.Fatalf("self dns_name = %q, want macbook", got)
+	}
+}

@@ -2,6 +2,7 @@ package control
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Zane-SI/dotlink/internal/magicdns"
 	"github.com/Zane-SI/dotlink/internal/proto"
 )
 
@@ -93,14 +95,18 @@ func (s *Server) fail(w http.ResponseWriter, op string, err error) {
 
 // storeError maps the three storage outcomes every handler shares.
 func (s *Server) storeError(w http.ResponseWriter, err error, notFoundMsg string) {
-	switch err {
-	case nil:
-	case errNotFound:
+	// errors.Is, not ==: these sentinels travel wrapped, and comparing
+	// pointers here would turn a 409 into a 500.
+	switch {
+	case err == nil:
+	case errors.Is(err, errNotFound):
 		writeError(w, http.StatusNotFound, notFoundMsg)
-	case errInviteUsed:
+	case errors.Is(err, errInviteUsed):
 		writeError(w, http.StatusConflict, "invite already used")
-	case errInviteExpired:
+	case errors.Is(err, errInviteExpired):
 		writeError(w, http.StatusGone, "invite expired")
+	case errors.Is(err, errHostnameTaken):
+		writeError(w, http.StatusConflict, err.Error())
 	default:
 		s.fail(w, "storage", err)
 	}
@@ -264,6 +270,7 @@ func (s *Server) buildMap(self nodeRow) (proto.PeerMap, error) {
 			continue
 		}
 		peers = append(peers, proto.Node{
+			DNSName:      magicdns.Label(n.Hostname),
 			NodeID:       n.ID,
 			Hostname:     n.Hostname,
 			Pubkey:       n.Pubkey,
@@ -283,6 +290,7 @@ func (s *Server) buildMap(self nodeRow) (proto.PeerMap, error) {
 			IPv4:     self.IPv4,
 			IPv6:     self.IPv6,
 			Hostname: self.Hostname,
+			DNSName:  magicdns.Label(self.Hostname),
 		},
 		Network: s.network(),
 		Peers:   peers,
