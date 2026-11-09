@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"os/user"
@@ -15,8 +16,12 @@ import (
 	"time"
 
 	"github.com/Zane-SI/dotlink/internal/agent"
+	"github.com/Zane-SI/dotlink/internal/ipc"
 	"github.com/Zane-SI/dotlink/internal/proto"
 )
+
+// version is stamped at build time with -ldflags -X main.version=…
+var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -33,6 +38,9 @@ func main() {
 		err = runUp(os.Args[2:])
 	case "status":
 		err = runStatus(os.Args[2:])
+	case "version", "-version", "--version":
+		fmt.Println(version)
+		return
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -54,6 +62,8 @@ func usage() {
   dotlink-agent up   [flags]                  bring the tunnel up (needs root)
   dotlink-agent nodes [flags]                 list the Nodes you can reach
   dotlink-agent status                        show this Node's identity and tunnel
+  dotlink-agent version                       print the build
+  dotlink-agent version                       print the build
 
 Run "dotlink-agent <command> -h" for flags.
 `)
@@ -148,8 +158,14 @@ func runUp(args []string) error {
 	listen := fs.String("listen", agent.DefaultUDPListen, "UDP listen address; the same socket carries Relay traffic and hole punching")
 	derpAddr := fs.String("derp", "", "DERP endpoint to use instead of the one in the Peer Map")
 	relayOnly := fs.Bool("relay-only", false, "skip hole punching and stay on the Relay")
+	socket := fs.String("socket", ipc.DefaultSocket, "Unix socket the menu bar app talks to")
+	adminToken := fs.String("admin-token", "", "Control Plane admin token; needed only to sign invites (env DOTLINK_ADMIN_TOKEN)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	token := *adminToken
+	if token == "" {
+		token = os.Getenv("DOTLINK_ADMIN_TOKEN")
 	}
 
 	st, err := agent.LoadState()
@@ -162,12 +178,36 @@ func runUp(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	d := &agent.Daemon{State: st, UDPListen: *listen, DERPAddr: *derpAddr, NoPunch: *relayOnly}
-	return d.Run(ctx)
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	d := &agent.Daemon{State: st, UDPListen: *listen, DERPAddr: *derpAddr, NoPunch: *relayOnly, Logger: log}
+
+	// The supervisor owns the tunnel; the socket owns the supervisor. A menu
+	// bar disconnect must not kill the process, or KeepAlive would bring the
+	// tunnel straight back.
+	sup := &agent.Supervisor{Run: d.Run, Logger: log}
+	go sup.Serve(ctx)
+
+	local := &agent.LocalControl{Supervisor: sup, State: st, AdminToken: token, Logger: log}
+	srv := &ipc.Server{Path: *socket, Provider: local, Logger: log}
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe(ctx) }()
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errc:
+		// The tunnel works without the socket; only the Client goes blind.
+		if err != nil {
+			log.Error("agent socket stopped", "err", err)
+		}
+		sup.Stop()
+		return err
+	}
 }
 
 func runStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	socket := fs.String("socket", ipc.DefaultSocket, "Unix socket the Agent listens on")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -182,6 +222,12 @@ func runStatus(args []string) error {
 	fmt.Printf("network: %s (MagicDNS .%s)\n", st.Network.Name, st.Network.Domain)
 	fmt.Printf("state:   %s\n", path)
 
+	// The socket is authoritative when the daemon is up: it knows whether the
+	// tunnel was disconnected without the process exiting.
+	if live, err := ipc.NewClient(*socket).Status(context.Background()); err == nil {
+		printLiveStatus(live)
+		return nil
+	}
 	rt, err := agent.LoadRuntime()
 	switch {
 	case err != nil:
@@ -239,4 +285,31 @@ func defaultHostname() string {
 		return u.Username
 	}
 	return "dotlink-node"
+}
+
+// printLiveStatus renders what the daemon reports over its socket.
+func printLiveStatus(st ipc.Status) {
+	state := "running"
+	if !st.Running {
+		state = "disconnected"
+	}
+	relay := st.RelayUDP
+	if st.RelayMode != "" {
+		relay = fmt.Sprintf("%s (%s)", st.RelayUDP, st.RelayMode)
+	}
+	fmt.Printf("agent:   %s (pid %d, relay %s)\n", state, st.PID, relay)
+	fmt.Printf("overlay: %s / %s\n", st.IPv4, st.IPv6)
+	if st.Error != "" {
+		fmt.Printf("error:   %s\n", st.Error)
+	}
+	if len(st.Peers) == 0 {
+		fmt.Println("peers:   none yet")
+		return
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "HOSTNAME\tIPV4\tPATH\tRTT")
+	for _, p := range st.Peers {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%v\n", p.Hostname, p.IPv4, p.Path, p.RTTms)
+	}
+	w.Flush()
 }

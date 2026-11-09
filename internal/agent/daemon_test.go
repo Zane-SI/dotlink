@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -363,4 +364,59 @@ func TestAgentsFallBackToDERPWhenUDPIsBlocked(t *testing.T) {
 	// Same tunnel, different transport: the ping must still come back.
 	again := tuntest.Ping(netip.MustParseAddr(book.IPv4), netip.MustParseAddr(mini.IPv4))
 	deliver(t, miniCh, bookCh, again, 10*time.Second)
+}
+
+// closeRecorder is a TUN that remembers whether the daemon closed it. The
+// disconnect promise is "no utun left behind", and that is exactly this bit.
+type closeRecorder struct {
+	tun.Device
+	closed atomic.Bool
+}
+
+func (r *closeRecorder) Close() error {
+	r.closed.Store(true)
+	return r.Device.Close()
+}
+
+func TestDisconnectTakesTheTUNWithIt(t *testing.T) {
+	r := newRig(t)
+	st, home := r.join(t, "mac-mini")
+
+	var rec *closeRecorder
+	sup := &Supervisor{
+		Logger: quietLogger(),
+		Run: func(ctx context.Context) error {
+			return (&Daemon{
+				State: st, Home: home,
+				UDPListen:     "127.0.0.1:0",
+				HelloInterval: 200 * time.Millisecond,
+				MakeTUN: func(int) (tun.Device, error) {
+					rec = &closeRecorder{Device: tuntest.NewChannelTUN().TUN()}
+					return rec, nil
+				},
+				Configure: func(context.Context, netcfg.Config) error { return nil },
+				Logger:    quietLogger(),
+			}).Run(ctx)
+		},
+	}
+	if err := sup.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := LoadRuntimeIn(home); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	sup.Stop()
+	if rec == nil {
+		t.Fatal("the daemon never created a TUN")
+	}
+	if !rec.closed.Load() {
+		t.Fatal("disconnect left the TUN open")
+	}
+	if _, err := LoadRuntimeIn(home); err == nil {
+		t.Fatal("disconnect left a stale runtime snapshot behind")
+	}
 }

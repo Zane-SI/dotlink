@@ -14,7 +14,14 @@ import (
 type Runtime struct {
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started_at"`
-	RelayUDP  string    `json:"relay_udp"`
+	// The Node's own identity, so a Client can draw the status without a
+	// second call to the Control Plane.
+	Hostname string `json:"hostname,omitempty"`
+	IPv4     string `json:"ipv4,omitempty"`
+	IPv6     string `json:"ipv6,omitempty"`
+	Network  string `json:"network,omitempty"`
+
+	RelayUDP string `json:"relay_udp"`
 	// RelayMode is "udp" or "derp": which transport relayed traffic uses.
 	RelayMode  string        `json:"relay_mode,omitempty"`
 	Registered bool          `json:"registered"`

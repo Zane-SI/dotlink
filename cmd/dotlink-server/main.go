@@ -25,6 +25,9 @@ import (
 	"github.com/Zane-SI/dotlink/internal/relay"
 )
 
+// version is stamped at build time with -ldflags -X main.version=…
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -38,6 +41,9 @@ func main() {
 		err = runRelay(os.Args[2:])
 	case "invite":
 		err = runInvite(os.Args[2:])
+	case "version", "-version", "--version":
+		fmt.Println(version)
+		return
 	case "-h", "--help", "help":
 		usage()
 		return

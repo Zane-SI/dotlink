@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.dotlink.agent</string>
+
+	<!-- The Agent runs as root because opening utun and rewriting routes is
+	     a root operation. It is not a Network Extension: no entitlement, no
+	     App Store review, and it works on macOS 13 and later alike. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/libexec/dotlink-agent</string>
+		<string>up</string>
+	</array>
+
+	<!-- Start at boot and restart on crash. A user disconnect stops the
+	     session, not the process, so KeepAlive does not undo it. -->
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+
+	<key>StandardOutPath</key>
+	<string>/var/log/dotlink-agent.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/dotlink-agent.log</string>
+
+	<!-- The socket is the only door; keep it off /tmp, which is shared. -->
+	<key>Umask</key>
+	<integer>23</integer>
+</dict>
+</plist>

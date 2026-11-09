@@ -15,7 +15,26 @@ mac-mini (家里)  ←── 直连 / 中继 ──→  MacBook (外地)
 
 ## 状态
 
-设计阶段。规格与决策已定，代码还没开始写。
+`v1` 的数据面已经跑通：Node 入网、Peer Map 长轮询、UDP Relay、打洞与直连切换、DERP 兼容退路、macOS 菜单栏客户端。Windows 与 iOS 客户端、MagicDNS、TLS 还没做——见 [issues](https://github.com/Zane-SI/dotlink/issues) 里的依赖图。
+
+## 试一下
+
+```sh
+make build                # 三个二进制，全部 CGO_ENABLED=0
+
+# 一台机器当 Control Plane（下面说到的“Gateway”）
+./bin/dotlink-server control -db dotlink.db -public-url http://<公网 IP>:8080 &
+./bin/dotlink-server relay -db dotlink.db -udp :3478 &
+
+# 签一张邀请，装到第二台机器上
+./bin/dotlink-server invite --server http://127.0.0.1:8080 --admin-token <启动时打印的 token>
+sudo ./bin/dotlink-agent join 'dotlink://enroll?...'
+
+# 两台机器各起一个 Agent，然后 `dotlink-agent nodes` 看路径
+sudo ./bin/dotlink-agent up
+```
+
+菜单栏客户端：`/Applications/Dotlink.app`（`sudo packaging/macos/install.sh` 安装），生成二维码、看直连/中继、断开与重连。
 
 ## 文档
 

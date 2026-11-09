@@ -27,3 +27,6 @@
 ios/build/
 ios/*.xcworkspace/xcuserdata/
 ios/DerivedData/
+
+# 构建产物（make build）
+/bin/

@@ -268,6 +268,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	state := &runtimeState{home: d.home(), rt: Runtime{
 		PID:       os.Getpid(),
 		StartedAt: time.Now().UTC(),
+		Hostname:  d.State.Hostname,
+		IPv4:      self.IPv4.String(),
+		IPv6:      self.IPv6.String(),
+		Network:   pm.Network.Name,
 		RelayUDP:  relayAddr.String(),
 		RelayMode: string(lnk.Mode()),
 		Peers:     runtimePeers(pm, mgr),
