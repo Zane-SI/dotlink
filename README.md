@@ -52,7 +52,7 @@ ADVERTISE_ROUTES=192.168.1.0/24 ./packaging/macos/install.sh
 
 也可以之后编辑该文件（逗号或换行分隔，`#` 开头是注释），再执行 `sudo launchctl kickstart -k system/com.dotlink.agent`。文件不存在就是普通 Node；`--advertise-routes` 仍然优先于文件，前台运行不受影响。安装脚本只会在传入 `ADVERTISE_ROUTES` 时写这个文件，重装不会清掉已有配置。
 
-通告被拒绝时（例如与别的 Gateway 的 409 冲突），Agent 会报错并保持停止，而不是每两秒重试；解决冲突后重新连接即可。
+通告被拒绝时（例如与别的 Gateway 的 409 冲突），Agent 会报错并保持停止，而不是每两秒重试；解决冲突后重新连接即可。同样的策略也用于本机没有到 advertised LAN 的路由：明确报错并停止，避免把 peer 的流量引向黑洞，而不是静默降级成普通 Node。
 
 Subnet Router 目前只在 macOS 上可用；Linux 及其他平台带 `--advertise-routes` 启动时会直接报 “not implemented”。
 
