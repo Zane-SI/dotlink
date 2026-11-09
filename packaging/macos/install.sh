@@ -24,6 +24,16 @@ sudo rm -rf /Applications/Dotlink.app
 sudo cp -R "$BAR_APP" /Applications/Dotlink.app
 sudo chown -R root:wheel /Applications/Dotlink.app
 
+# The launchd job has no shell, so a Gateway is configured through this file
+# instead of editing ProgramArguments. A flag on `dotlink-agent up` still wins.
+if [ -n "${ADVERTISE_ROUTES:-}" ]; then
+	sudo install -d -m 0755 /usr/local/etc/dotlink
+	printf '%s\n' "$ADVERTISE_ROUTES" | sudo tee /usr/local/etc/dotlink/advertise-routes >/dev/null
+	sudo chmod 0644 /usr/local/etc/dotlink/advertise-routes
+	sudo chown root:wheel /usr/local/etc/dotlink/advertise-routes
+	echo "gateway routes: $ADVERTISE_ROUTES"
+fi
+
 sudo install -m 0644 -o root -g wheel "$PLIST" /Library/LaunchDaemons/com.dotlink.agent.plist
 
 # bootout fails when the daemon is not loaded yet; that is the normal first

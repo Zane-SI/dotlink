@@ -38,13 +38,19 @@ sudo ./bin/dotlink-agent up
 
 ## Subnet Router（Gateway）
 
-默认 Agent 只把自己放进 Overlay。要让别的 Node 访问这台机器所在的局域网，启动时**必须**加 `--advertise-routes`：
+默认 Agent 只把自己放进 Overlay。要让别的 Node 访问这台机器所在的局域网，启动时用 `--advertise-routes`（打包版也可以写配置文件）：
 
 ```sh
 sudo ./bin/dotlink-agent up --advertise-routes=192.168.1.0/24
 ```
 
-这个 flag 只在 Agent 的启动命令上生效，launchd 拉起的那条命令也要带上，否则重启后就是普通 Node（同时撤销上一次的通告）。打包里的 launchd plist 还没有这个开关，属于后续工作；目前需要手动写进本机 plist，或者直接前台运行。
+launchd 没有 shell，不能把 flag 拼进启动命令，因此打包版从 `/usr/local/etc/dotlink/advertise-routes` 读取前缀。安装时传入：
+
+```sh
+ADVERTISE_ROUTES=192.168.1.0/24 ./packaging/macos/install.sh
+```
+
+也可以之后编辑该文件（逗号或换行分隔，`#` 开头是注释），再执行 `sudo launchctl kickstart -k system/com.dotlink.agent`。文件不存在就是普通 Node；`--advertise-routes` 仍然优先于文件，前台运行不受影响。安装脚本只会在传入 `ADVERTISE_ROUTES` 时写这个文件，重装不会清掉已有配置。
 
 通告被拒绝时（例如与别的 Gateway 的 409 冲突），Agent 会报错并保持停止，而不是每两秒重试；解决冲突后重新连接即可。
 

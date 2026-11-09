@@ -231,6 +231,14 @@ func runUp(args []string) error {
 	if err != nil {
 		return err
 	}
+	if len(opts.routes) == 0 {
+		// launchd has no shell to put --advertise-routes on the command line;
+		// the config file is how a packaged Gateway advertises its LAN.
+		opts.routes, err = agent.LoadAdvertiseRoutes()
+		if err != nil {
+			return err
+		}
+	}
 	token := opts.adminToken
 	if token == "" {
 		token = os.Getenv("DOTLINK_ADMIN_TOKEN")

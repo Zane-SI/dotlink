@@ -12,6 +12,8 @@ sudo rm -rf /Applications/Dotlink.app
 # dead endpoint), so remove it explicitly.
 sudo rm -f /var/run/dotlink.sock
 sudo rm -f /var/log/dotlink-agent.log
+sudo rm -f /usr/local/etc/dotlink/advertise-routes
+sudo rmdir /usr/local/etc/dotlink 2>/dev/null || true
 
 # Orphan utun interfaces go away with the process; say so rather than pretend
 # to clean something that is already gone.
