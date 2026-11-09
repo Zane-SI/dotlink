@@ -146,6 +146,8 @@ func runNodes(args []string) error {
 func runUp(args []string) error {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
 	listen := fs.String("listen", agent.DefaultUDPListen, "UDP listen address; the same socket carries Relay traffic and hole punching")
+	derpAddr := fs.String("derp", "", "DERP endpoint to use instead of the one in the Peer Map")
+	relayOnly := fs.Bool("relay-only", false, "skip hole punching and stay on the Relay")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -160,7 +162,7 @@ func runUp(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	d := &agent.Daemon{State: st, UDPListen: *listen}
+	d := &agent.Daemon{State: st, UDPListen: *listen, DERPAddr: *derpAddr, NoPunch: *relayOnly}
 	return d.Run(ctx)
 }
 

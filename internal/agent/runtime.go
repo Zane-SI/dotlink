@@ -12,9 +12,11 @@ import (
 // rewrites, not a control channel: nothing here is authoritative, and a stale
 // file after a crash is corrected by the next start.
 type Runtime struct {
-	PID        int           `json:"pid"`
-	StartedAt  time.Time     `json:"started_at"`
-	RelayUDP   string        `json:"relay_udp"`
+	PID       int       `json:"pid"`
+	StartedAt time.Time `json:"started_at"`
+	RelayUDP  string    `json:"relay_udp"`
+	// RelayMode is "udp" or "derp": which transport relayed traffic uses.
+	RelayMode  string        `json:"relay_mode,omitempty"`
 	Registered bool          `json:"registered"`
 	Peers      []RuntimePeer `json:"peers"`
 }

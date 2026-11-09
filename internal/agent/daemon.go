@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,6 +16,8 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 
+	"github.com/Zane-SI/dotlink/internal/derp"
+	"github.com/Zane-SI/dotlink/internal/link"
 	"github.com/Zane-SI/dotlink/internal/netcfg"
 	"github.com/Zane-SI/dotlink/internal/proto"
 	"github.com/Zane-SI/dotlink/internal/punch"
@@ -50,6 +53,20 @@ type Daemon struct {
 	// values make recovery from a Relay restart fast at the cost of chatter;
 	// the default is the 25s the spec asks for.
 	HelloInterval time.Duration
+
+	// DERPAddr overrides the DERP endpoint from the Peer Map. Empty means use
+	// relays[0].derp, which is what a deployment wants.
+	DERPAddr string
+	// DERPTLS configures certificate verification for DERP. Nil means system
+	// roots, which is right for a real certificate and wrong for a test.
+	DERPTLS *tls.Config
+	// LinkFailAfter is how long UDP may stay unregistered before DERP takes
+	// over. Zero means link.DefaultFailAfter.
+	LinkFailAfter time.Duration
+	// NoPunch keeps the tunnel on the Relay. Punching is not always possible
+	// (some carriers never let a mapping through) and skipping it is cheaper
+	// than watching five rounds fail every minute.
+	NoPunch bool
 
 	// MakeTUN and Configure are the only privileged steps. Tests replace them.
 	MakeTUN   func(mtu int) (tun.Device, error)
@@ -153,17 +170,47 @@ func (d *Daemon) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// DERP is optional: a network where UDP works never needs it, and an
+	// Agent with no DERP configured must still come up.
+	derpAddr := d.DERPAddr
+	if derpAddr == "" {
+		derpAddr = derpFromMap(pm)
+	}
+	var derpClient *derp.Client
+	if derpAddr != "" {
+		dc, err := dialDERP(runCtx, derpAddr, pub, d.DERPTLS, log)
+		if err != nil {
+			log.Warn("derp unavailable, continuing on udp only", "addr", derpAddr, "err", err)
+		} else {
+			derpClient = dc
+		}
+	}
+	// A typed nil in an interface is not nil: hand over an untyped nil when
+	// there is no DERP client, or the pump would be started on nothing.
+	var derpBackend link.DERPBackend
+	if derpClient != nil {
+		derpBackend = derpClient
+	}
+	lnk := link.New(client, derpBackend, log)
+	if d.LinkFailAfter > 0 {
+		lnk.FailAfter = d.LinkFailAfter
+	}
+	go lnk.Run(runCtx)
+	if derpAddr != "" {
+		go maintainDERP(runCtx, derpAddr, pub, d.DERPTLS, lnk, log)
+	}
+
 	mgr := punch.New(punch.Config{
 		Private:   priv,
 		Public:    pub,
-		Transport: probeSender{client},
+		Transport: probeSender{lnk},
 		Logger:    log,
 	})
 	client.SetProbeHandler(func(from netip.AddrPort, frame []byte) {
 		mgr.Handle(from, frame)
 	})
 	go mgr.Run(runCtx)
-	if set, err := punchPeers(pm); err == nil {
+	if set, err := punchPeers(pm); err == nil && !d.NoPunch {
 		mgr.SetPeers(set)
 	}
 
@@ -206,7 +253,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	ownsTUN = false // New takes the device over, including closing it on error
-	dev, err := tunnel.New(tunDev, tunnel.NewBind(client, mgr), tunnel.DeviceConfig{
+	dev, err := tunnel.New(tunDev, tunnel.NewBind(lnk, mgr), tunnel.DeviceConfig{
 		PrivateKey: priv,
 		Peers:      peers,
 		Logger:     device.NewLogger(device.LogLevelError, "dotlink"),
@@ -222,6 +269,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		PID:       os.Getpid(),
 		StartedAt: time.Now().UTC(),
 		RelayUDP:  relayAddr.String(),
+		RelayMode: string(lnk.Mode()),
 		Peers:     runtimePeers(pm, mgr),
 	}}
 	// A path change is worth a status refresh right away: punching is fast,
@@ -246,7 +294,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		d.heartbeatLoop(runCtx, ctrl, client, mgr, live, state, heartbeat)
+		d.heartbeatLoop(runCtx, ctrl, client, lnk, mgr, live, state, heartbeat)
 	}()
 	go func() {
 		defer wg.Done()
@@ -267,7 +315,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 // heartbeatLoop is the Node's only unconditional sign of life. It also
 // refreshes the Relay's registration flag in the status snapshot, because a
 // Relay restart is exactly the thing a user wants to see.
-func (d *Daemon) heartbeatLoop(ctx context.Context, ctrl *Control, client *relay.Client, mgr *punch.Manager, live *livePeers, st *runtimeState, every time.Duration) {
+func (d *Daemon) heartbeatLoop(ctx context.Context, ctrl *Control, client *relay.Client, lnk *link.Link, mgr *punch.Manager, live *livePeers, st *runtimeState, every time.Duration) {
 	log := d.logger()
 	t := time.NewTicker(every)
 	defer t.Stop()
@@ -282,6 +330,9 @@ func (d *Daemon) heartbeatLoop(ctx context.Context, ctrl *Control, client *relay
 			// Paths change between two heartbeats: punching is asynchronous.
 			// Refreshing here keeps `status` honest without a second timer.
 			changed := st.setRegistered(client.Registered())
+			if st.setMode(string(lnk.Mode())) {
+				changed = true
+			}
 			if pm := live.get(); pm != nil && st.setPeers(runtimePeers(pm, mgr)) {
 				changed = true
 			}
@@ -360,9 +411,9 @@ func (d *Daemon) mapLoop(ctx context.Context, ctrl *Control, dev *tunnel.Device,
 			continue
 		}
 		live.set(pm)
-		if set, err := punchPeers(pm); err == nil {
+		if set, err := punchPeers(pm); err == nil && !d.NoPunch {
 			mgr.SetPeers(set)
-		} else {
+		} else if err != nil {
 			log.Warn("map: bad candidate set", "err", err)
 		}
 		if st.setPeers(runtimePeers(pm, mgr)) {
@@ -385,6 +436,16 @@ func (s *runtimeState) save(log *slog.Logger) {
 	if err := SaveRuntimeIn(s.home, snapshot); err != nil {
 		log.Warn("write runtime file", "err", err)
 	}
+}
+
+func (s *runtimeState) setMode(m string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rt.RelayMode == m {
+		return false
+	}
+	s.rt.RelayMode = m
+	return true
 }
 
 func (s *runtimeState) setRegistered(v bool) bool {
@@ -541,7 +602,9 @@ func punchPeers(pm *proto.PeerMap) ([]punch.Peer, error) {
 // probeSender puts probes on the same socket the Relay link uses, so the
 // mapping a punch creates is the mapping WireGuard sends from.
 type probeSender struct {
-	client *relay.Client
+	client interface {
+		SendToAddr(addr netip.AddrPort, payload []byte) error
+	}
 }
 
 func (p probeSender) SendProbe(addr netip.AddrPort, frame []byte) error {
@@ -579,4 +642,48 @@ func lanCandidates(pc net.PacketConn) []proto.Candidate {
 		return nil
 	}
 	return []proto.Candidate{{Addr: addr.AddrPort().String(), Kind: "lan"}}
+}
+
+// derpFromMap returns the DERP endpoint the Control Plane advertised, if any.
+// Only the first Relay ever has one: v1 runs a single Relay.
+func derpFromMap(pm *proto.PeerMap) string {
+	for _, r := range pm.Relays {
+		if r.DERP != "" {
+			return r.DERP
+		}
+	}
+	return ""
+}
+
+// dialDERP opens the TLS fallback. A failure is not fatal: the Agent keeps the
+// UDP Relay and tries again from maintainDERP.
+func dialDERP(ctx context.Context, addr string, pub [32]byte, tlsCfg *tls.Config, log *slog.Logger) (*derp.Client, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return derp.Dial(ctx, derp.Config{Addr: addr, TLS: tlsCfg, Key: pub, Logger: log})
+}
+
+// maintainDERP reconnects the fallback whenever it is not up. The DERP server
+// may restart, the path may be re-established after a sleep; none of that
+// should need an Agent restart.
+func maintainDERP(ctx context.Context, addr string, pub [32]byte, tlsCfg *tls.Config, lnk *link.Link, log *slog.Logger) {
+	t := time.NewTicker(10 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if lnk.DERPUp() {
+				continue
+			}
+			c, err := dialDERP(ctx, addr, pub, tlsCfg, log)
+			if err != nil {
+				log.Debug("derp still unreachable", "addr", addr, "err", err)
+				continue
+			}
+			lnk.SetDERP(c)
+			log.Info("derp connected", "addr", addr)
+		}
+	}
 }

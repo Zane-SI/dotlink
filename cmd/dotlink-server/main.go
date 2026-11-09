@@ -4,9 +4,13 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -16,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Zane-SI/dotlink/internal/control"
+	"github.com/Zane-SI/dotlink/internal/derp"
 	"github.com/Zane-SI/dotlink/internal/proto"
 	"github.com/Zane-SI/dotlink/internal/relay"
 )
@@ -136,6 +141,9 @@ func runRelay(args []string) error {
 	db := fs.String("db", "dotlink.db", "Control Plane database to read the Relay secret from")
 	secret := fs.String("secret", "", "Relay secret (defaults to the one stored in -db)")
 	udp := fs.String("udp", ":3478", "UDP listen address Agents reach")
+	derpAddr := fs.String("derp", "", "TLS listen address for the DERP fallback, e.g. :8443 (empty disables it)")
+	certFile := fs.String("tls-cert", "", "certificate for -derp, PEM")
+	keyFile := fs.String("tls-key", "", "private key for -derp, PEM")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -163,12 +171,52 @@ func runRelay(args []string) error {
 	go func() { errc <- srv.Serve(pc) }()
 	fmt.Printf("relay listening on %s\n", pc.LocalAddr())
 
+	if *derpAddr != "" {
+		dsrv, err := startDERP(*derpAddr, *certFile, *keyFile)
+		if err != nil {
+			return err
+		}
+		defer dsrv.Close()
+	}
+
 	select {
 	case <-ctx.Done():
 		return nil
 	case err := <-errc:
 		return err
 	}
+}
+
+// startDERP brings up the TLS fallback next to the UDP Relay. Without a
+// certificate there is nothing to hand a client, so both files are required:
+// an unauthenticated DERP endpoint is indistinguishable from a man in the
+// middle.
+func startDERP(addr, certFile, keyFile string) (*derp.Server, error) {
+	if certFile == "" || keyFile == "" {
+		return nil, errors.New("-derp needs -tls-cert and -tls-key")
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load certificate: %w", err)
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen %s: %w", addr, err)
+	}
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	srv := derp.NewServer(key, log)
+	go func() {
+		if err := srv.ServeTLS(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}); err != nil {
+			log.Error("derp stopped", "err", err)
+		}
+	}()
+	fmt.Printf("derp listening on https://%s%s\n", ln.Addr(), derp.Path)
+	return srv, nil
 }
 
 func runInvite(args []string) error {

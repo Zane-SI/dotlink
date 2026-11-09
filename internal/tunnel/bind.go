@@ -26,7 +26,7 @@ const keyPrefix = "pk:"
 // Relay link and (from #3 on) direct peer traffic, so the NAT mapping built by
 // a successful hole punch is immediately usable by WireGuard.
 type Bind struct {
-	client *relay.Client
+	client Transport
 	router Router
 
 	mu     sync.Mutex
@@ -43,7 +43,17 @@ type Router interface {
 	Touch(key [32]byte)
 }
 
-func NewBind(c *relay.Client, router Router) *Bind {
+// Transport is everything the Bind needs from the Relay path. It is
+// implemented by link.Link, which owns the UDP/DERP choice, and by
+// relay.Client directly in tests that only exercise one transport.
+type Transport interface {
+	Packets() <-chan relay.Packet
+	SendTo(key [32]byte, payload []byte) error
+	SendToAddr(addr netip.AddrPort, payload []byte) error
+	LocalAddr() netip.AddrPort
+}
+
+func NewBind(c Transport, router Router) *Bind {
 	return &Bind{client: c, router: router}
 }
 
