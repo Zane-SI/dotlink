@@ -54,7 +54,7 @@ ADVERTISE_ROUTES=192.168.1.0/24 ./packaging/macos/install.sh
 
 通告被拒绝时（例如与别的 Gateway 的 409 冲突），Agent 会报错并保持停止，而不是每两秒重试；解决冲突后重新连接即可。同样的策略也用于本机没有到 advertised LAN 的路由：明确报错并停止，避免把 peer 的流量引向黑洞，而不是静默降级成普通 Node。
 
-Subnet Router 目前只在 macOS 上可用；Linux 及其他平台带 `--advertise-routes` 启动时会直接报 “not implemented”。
+Subnet Router 在 macOS 上用 pf，在 Linux 上用 `iproute2` + `iptables`/`ip6tables`（需要 root；只装了 nft 而没有 iptables 的环境会明确报错）。Linux 的安装包尚未提供，按源码构建后用 `sudo ./bin/dotlink-agent up --advertise-routes=...` 即可。Windows 及其他平台带 `--advertise-routes` 启动时仍会报 “not implemented”。
 
 ## 文档
 
@@ -67,7 +67,7 @@ Subnet Router 目前只在 macOS 上可用；Linux 及其他平台带 `--adverti
 - 任一侧是 hard NAT（对称 NAT / CGNAT / 移动网络）时打洞基本失败，只能走中继。
 - DERP 兼容中继是 TCP-over-TCP，单流吞吐有天花板，只能当退路。
 - iOS 客户端只走 TestFlight（App Store 审核指南 5.4 要求 VPN 类应用由 organization 账号提供）。
-- Subnet Router 目前只在 macOS 上实现；Linux 及其他平台带 `--advertise-routes` 启动时会报 “not implemented”。
+- Subnet Router 的 Windows 版本尚未实现；Linux 版本依赖 `iptables`/`ip6tables`，在只提供 nft 的环境里需要先装兼容层。
 
 ## 许可证
 

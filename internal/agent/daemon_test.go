@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -602,6 +603,12 @@ func TestDaemonSyncsRoutesThroughTheKernel(t *testing.T) {
 	want := []string{
 		"route -n add -net 192.168.1.0/24 -interface utun5",
 		"route -n delete -net 10.0.0.0/8 -interface utun5",
+	}
+	if runtime.GOOS == "linux" {
+		want = []string{
+			"ip route add 192.168.1.0/24 dev utun5",
+			"ip route del 10.0.0.0/8 dev utun5",
+		}
 	}
 	if strings.Join(rec.cmds, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("commands:\n%s\nwant:\n%s", strings.Join(rec.cmds, "\n"), strings.Join(want, "\n"))

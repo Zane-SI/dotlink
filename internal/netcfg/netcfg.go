@@ -1,9 +1,10 @@
 // Package netcfg puts the overlay addresses and routes on the TUN device.
 //
-// It shells out to ifconfig and route for the same reason wg-quick does:
-// the ioctl path is per-platform and easy to get subtly wrong, while the
-// command line is stable, visible in `ps`, and trivial to reproduce by hand
-// when something goes wrong at 2am.
+// It shells out to the platform's routing tools (ifconfig/route on macOS,
+// ip on Linux) for the same reason wg-quick does: the ioctl path is
+// per-platform and easy to get subtly wrong, while the command line is
+// stable, visible in `ps`, and trivial to reproduce by hand when something
+// goes wrong at 2am.
 package netcfg
 
 import (
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os/exec"
+	"runtime"
 	"strings"
 )
 
@@ -71,6 +73,9 @@ func Configure(ctx context.Context, r Runner, c Config) error {
 	if c.Name == "" {
 		return fmt.Errorf("netcfg: no interface name")
 	}
+	if runtime.GOOS == "linux" {
+		return configureLinux(ctx, r, c)
+	}
 	steps := [][]string{
 		{"ifconfig", c.Name, "mtu", fmt.Sprint(c.mtu())},
 		{"ifconfig", c.Name, "inet", c.IPv4.String(), c.IPv4.String(), "netmask", netmask(c.IPv4Net), "up"},
@@ -85,6 +90,30 @@ func Configure(ctx context.Context, r Runner, c Config) error {
 	}
 	// Routes go through AddRoute so a route that already exists is success, not
 	// a dead session: a restart would otherwise fail on "File exists" forever.
+	for _, p := range c.Routes {
+		if err := AddRoute(ctx, r, c.Name, p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// configureLinux uses iproute2: ifconfig is often absent on modern Linux,
+// and `ip addr replace` makes a restart idempotent instead of dying on
+// "File exists".
+func configureLinux(ctx context.Context, r Runner, c Config) error {
+	steps := [][]string{
+		{"ip", "link", "set", "dev", c.Name, "mtu", fmt.Sprint(c.mtu()), "up"},
+		{"ip", "addr", "replace", fmt.Sprintf("%s/%d", c.IPv4, c.IPv4Net.Bits()), "dev", c.Name},
+	}
+	if c.IPv6.IsValid() {
+		steps = append(steps, []string{"ip", "-6", "addr", "replace", fmt.Sprintf("%s/%d", c.IPv6, c.IPv6Net.Bits()), "dev", c.Name})
+	}
+	for _, s := range steps {
+		if err := r.Run(ctx, s[0], s[1:]...); err != nil {
+			return fmt.Errorf("netcfg: %w", err)
+		}
+	}
 	for _, p := range c.Routes {
 		if err := AddRoute(ctx, r, c.Name, p); err != nil {
 			return err
@@ -119,6 +148,9 @@ func AddRoute(ctx context.Context, r Runner, iface string, p netip.Prefix) error
 	if !p.IsValid() || iface == "" {
 		return fmt.Errorf("netcfg: add route needs an interface and a prefix")
 	}
+	if runtime.GOOS == "linux" {
+		return addRouteLinux(ctx, r, iface, p)
+	}
 	if err := r.Run(ctx, "route", routeArgs("add", iface, p)...); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "file exists") {
 			existing, lookupErr := RouteInterface(ctx, r, p)
@@ -142,8 +174,47 @@ func DeleteRoute(ctx context.Context, r Runner, iface string, p netip.Prefix) er
 	if !p.IsValid() || iface == "" {
 		return fmt.Errorf("netcfg: delete route needs an interface and a prefix")
 	}
+	if runtime.GOOS == "linux" {
+		return deleteRouteLinux(ctx, r, iface, p)
+	}
 	if err := r.Run(ctx, "route", routeArgs("delete", iface, p)...); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "not in table") {
+			return nil
+		}
+		return fmt.Errorf("netcfg: delete route %s: %w", p, err)
+	}
+	return nil
+}
+
+func addRouteLinux(ctx context.Context, r Runner, iface string, p netip.Prefix) error {
+	args := []string{"route", "add", p.Masked().String(), "dev", iface}
+	if p.Addr().Is6() {
+		args = append([]string{"-6"}, args...)
+	}
+	if err := r.Run(ctx, "ip", args...); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "file exists") {
+			existing, lookupErr := RouteInterface(ctx, r, p)
+			if lookupErr != nil {
+				return fmt.Errorf("netcfg: add route %s: route exists but its interface could not be read: %w", p, lookupErr)
+			}
+			if existing != "" && existing != iface {
+				return fmt.Errorf("netcfg: route %s already exists on %s, not %s; refusing to shadow it", p, existing, iface)
+			}
+			return nil
+		}
+		return fmt.Errorf("netcfg: add route %s: %w", p, err)
+	}
+	return nil
+}
+
+func deleteRouteLinux(ctx context.Context, r Runner, iface string, p netip.Prefix) error {
+	args := []string{"route", "del", p.Masked().String(), "dev", iface}
+	if p.Addr().Is6() {
+		args = append([]string{"-6"}, args...)
+	}
+	if err := r.Run(ctx, "ip", args...); err != nil {
+		low := strings.ToLower(err.Error())
+		if strings.Contains(low, "no such process") || strings.Contains(low, "not found") {
 			return nil
 		}
 		return fmt.Errorf("netcfg: delete route %s: %w", p, err)
